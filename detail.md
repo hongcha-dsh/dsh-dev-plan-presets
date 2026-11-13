@@ -1,6 +1,28 @@
 # detail — dsh-dev-plan-presets
 
-## 一、机制落点（依据 DSH 0.2.2-rc.1 随包文档）
+## 一、这是什么
+
+给昂贵主模型用的「只做判断」preset：规划与静态复核，不实施。
+
+- `dev-plan`：主代理。只保留对话、`recon` / `review` / `scribe` 三个委派入口和子代理管理；不声明任何文件、搜索、Web、Shell 行。
+- `scout`：只读子代理，被 `recon` / `review` 调用。只能读文件、读图、搜索、查网页；没有写、没有 Shell、没有 Git 与测试。
+- `scribe`：记录子代理，被 `scribe` 调用。只能把主代理定稿的规划/复核文档逐字写入指定路径。
+
+## 二、必须知道的边界（B 方案）
+
+DSH 的 preset 只决定角色挂载哪些插件行，**不是全局工具白名单**。本机全局插件会向所有角色注入
+`config_backup` / `config_restore` / `config_sync_*` / `config_import_*` 与 `working_directory` 等工具。
+
+因此本包提供的是：
+
+> **preset 声明层隔离 + persona 明令禁止 + 实际工具面审计。**
+
+不是硬安全隔离。persona 禁止调用未声明工具，但若模型无视提示词，全局注入的工具仍可能被调用。
+需要硬隔离请另做工具掩码或全局禁用相关插件——本包明确不做。
+
+同理，`scribe` 的「只写文档」是路径纪律，不是路径白名单。
+
+## 三、机制落点（依据 DSH 0.2.2-rc.1 随包文档）
 
 | 需求 | 用的机制 | 依据（包内文档） |
 |---|---|---|
@@ -18,8 +40,9 @@
 | 人设不丢部署级后缀 | persona 同时写 `prefix` **和** `suffix` | `dsh-persona/README.zh.md`：「省略或空文本会遮蔽掉全局后缀」 |
 | 问用户 | `dsh-tool-ask-user`（默认阻塞模式） | `dsh-tool-ask-user/README.zh.md` |
 | 子代理管理 | `dsh-tool-subagent-control`：`send_message` / `interrupt_agent` / `list_agents` | `dsh-tool-subagent-control/README.zh.md` |
+| 插件页显示本文件 | `locale/*.json` 的 `meta.detail: "detail.md"`；缺省时才回退 README | `dsh-plugin-detail/README.zh.md`「文档顺序」 |
 
-## 二、关键设计约束
+## 四、关键设计约束
 
 1. **`agentPreset` 必须显式写。** 省略时子级"加入父方当前 preset 代际"——也就是继承 `dev-plan` 这套没有仓库工具的 preset，scout 会变成什么都读不了。
 2. **平铺 `tool-subagent`，不套 `cordis:group`。** standard 把它们放进 `isolate: workflowEngine` 组，是因为要挂 `workflow-ptc`；本包不挂 workflow，也就不需要那个隔离域。三个实例在同一个 agent 作用域里靠 `toolName` 区分。
@@ -29,25 +52,25 @@
 6. **`index.js` 是空壳。** 不注册工具、不注册路由、不注入提示词；存在的意义是让 bundle 在插件页有一行可管理，并在加载时做一次打包自检（缺补丁文件只告警，不让 Host 启动失败）。
 7. **persona 不写模板变量。** 循环只注册 `provider` / `model`，未知变量会让**每次请求的提示词组装直接抛错**；本包连 `{{model}}` 都不写，静态检查里也禁止出现 `{{`。
 
-## 三、明确的非目标
+## 五、明确的非目标
 
 - 不做工具掩码插件（B 方案）：能硬隔离，但要额外代码 + 可行性实测；本次按用户选择保持纯静态。
 - 不做带 Shell 的 `probe` 角色：Shell 无法按子代理禁写，写了只能靠事后比对检测。
 - 不做 `scribe` 的路径白名单：preset 机制没有按路径限写的开关。
-- 不改 `standard`、不改默认 preset、不改桥接插件与模型钉。
+- 不改 `standard`、不改默认 preset、不改桥接插件与模型钉、不改插件 `askLimit`。
 
-## 四、未验证项（本机没有安装，故以下均为"待实测"）
+## 六、未验证项（本机尚未安装，故以下均为"待实测"）
 
 - [ ] bundle 装载后三个 preset 是否真的出现在选择器，`order` 10/90/91 的排序是否正确。
-- [ ] `dev-plan` 会话的实际工具清单是否只剩 `ask_user_question` / `recon` / `review` / `scribe` / `send_message` / `list_agents` / `interrupt_agent`（含全局插件是否注入额外工具）。
+- [ ] `dev-plan` 会话的**实际**工具清单：声明的七个 + 全局注入的 `working_directory` / `config_*`，并确认 persona 禁止后模型不会调用。
 - [ ] `agentOptions` 与 `dsh-subagent-model-pin`（`honorExplicit: false`）并存时，子会话实际路由是否仍为 `dsh-opencode-go / deepseek-v4.1-flash`。
+- [ ] profile 缺少该 provider/model 时，委派是否在创建子代理时失败（而非静默继承贵模型）。
 - [ ] `agentPreset: scout` 在委派时能否正确解析（未知 id 只在调用时报错，加载时不报）。
 - [ ] 三个 `cordis:group` 压缩行在同一个 agent 作用域内多次挂载是否无冲突。
 - [ ] `scribe` 在 workspace-write 沙箱下对项目目录的写入是否被允许，越界时错误是否可读。
-- [ ] 插件管理页是否显示本包一行（locale/icon 是否生效）。
+- [ ] 插件管理页是否显示本包一行，且详细文档来自本文件（`meta.detail`）。
 
-## 五、静态验证
+## 七、静态验证
 
-`node scripts/verify-presets.mjs`（144 项）：解析四份补丁，检查 preset id/order、工具面白名单、三入口的 `toolName` / `agentPreset` / `provider` / `maxDepth` / 路由、scout 只读开关、scribe 读写开关、persona 合同、打包清单。
-
-它只覆盖**声明**；运行期行为必须按 README「验证」的手工清单逐条确认。
+`node scripts/verify-presets.mjs`：声明层合同 + `node --check` + `import`/`apply()` smoke + 负向变异。
+它只覆盖**声明与脚本自检**；运行期行为必须按 README「验证」的手工清单逐条确认。

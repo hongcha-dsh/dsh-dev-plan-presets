@@ -6,6 +6,7 @@
   "description": "DSH 开发规划与复核预设：昂贵主模型只做规划与静态复核，查证/遍历/落盘全部交给 scout 与 scribe 子代理，永不实施（纯静态 preset 组合）。",
   "exports": {
     ".": "./index.js",
+    "./package.json": "./package.json",
     "./cordis.patch.yml": "./cordis.patch.yml",
     "./presets/*.patch.yml": "./presets/*.patch.yml",
     "./locale/*.json": "./locale/*.json",

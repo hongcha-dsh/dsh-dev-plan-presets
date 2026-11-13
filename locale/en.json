@@ -1,6 +1,7 @@
 {
   "meta": {
     "title": "Dev plan & review",
-    "description": "An expensive main model that only plans and reviews: recon goes to scout, document writes go to scribe. Ships a plan or a review verdict, never implements."
+    "description": "An expensive main model that only plans and statically reviews: recon, traversal and web lookups go to the read-only scout, document writes go to scribe. Ships a plan or a review verdict, never implements.",
+    "detail": "detail.md"
   }
 }

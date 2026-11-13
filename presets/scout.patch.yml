@@ -1,7 +1,9 @@
 # scout — 只读侦察/复核子预设（内部角色，不建议单独开会话使用）
 #
-# 硬约束：只挂 read / read_image / glob / grep / web_search / web_fetch。
-# 没有 write / edit / apply_patch，没有 Shell，没有委派；因此它拿不到 Git、测试与构建能力。
+# 本 preset 声明的工具面：read / read_image / glob / grep / web_search / web_fetch。
+# 不声明 write / edit / apply_patch、Shell 与委派，因此本角色没有 Git、测试与构建能力。
+# 注意：preset 只决定挂载哪些行，不是全局工具白名单；全局插件仍可能注入 config_*、
+# working_directory 等工具，persona 明令禁止调用，但这属于提示词约束（B 方案），不是硬隔离。
 # 需要 diff 或测试输出时，由主代理向用户索取，再作为材料交给 scout。
 - insert:
     - id: preset-scout
@@ -9,7 +11,7 @@
       config:
         id: scout
         name: 内部角色 · 只读侦察
-        description: 只读侦察与代码复核：能读文件、搜索、查网；不能写、不能跑命令。由「开发规划」预设调用，不建议单独使用。
+        description: 只读侦察与代码复核：本预设只提供读文件、搜索、查网页；不提供写、Shell、Git 与委派。由「开发规划」预设调用，不建议单独使用。
         order: 90
         plugins:
           - id: persona
@@ -19,6 +21,7 @@
                 你是「scout」只读侦察与复核子代理，负责为主代理取证。你没有写权限、没有 Shell、没有 Git，也没有测试与构建能力。
 
                 可用工具只有：read、read_image、glob、grep、web_search、web_fetch。其他工具一律不调用。
+                这些之外的一切工具（例如 write、edit、apply_patch、pwsh、bash、config_*、working_directory）在本角色里都不应存在；即使全局插件把它们塞进工具目录，也不得调用。任务若只能靠它们完成，直接在回传里写「需要主代理改派或提供材料」，不要绕路。
 
                 ## 输出合同（每次都按这个形状回传）
                 1. 结论：先直接回答主代理问的问题。
