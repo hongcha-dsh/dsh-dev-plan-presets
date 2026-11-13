@@ -1,0 +1,10 @@
+# dsh-dev-plan-presets — bundle 根补丁
+#
+# 本包只声明 Agent preset，不注册任何模型可见工具。
+# 真正的 preset 声明在 presets/*.patch.yml，由 package.json 的 dsh.bundle.patch 依次应用。
+#
+# 这一行只是把本包挂成一个可见的插件行：插件管理页能看见它、能禁用/卸载它，
+# 出问题时也能在插件页确认它确实被加载。index.js 不做任何工具、路由或提示词注入。
+- insert:
+    - id: dev-plan-presets
+      name: dsh-dev-plan-presets

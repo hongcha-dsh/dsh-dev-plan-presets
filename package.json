@@ -1,0 +1,39 @@
+{
+  "name": "dsh-dev-plan-presets",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "DSH 开发规划与复核预设：昂贵主模型只做规划与静态复核，查证/遍历/落盘全部交给 scout 与 scribe 子代理，永不实施（纯静态 preset 组合）。",
+  "exports": {
+    ".": "./index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./presets/*.patch.yml": "./presets/*.patch.yml",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "presets/dev-plan.patch.yml",
+    "presets/scout.patch.yml",
+    "presets/scribe.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "detail.md",
+    "scripts/verify-presets.mjs"
+  ],
+  "scripts": {
+    "verify": "node scripts/verify-presets.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": [
+        "./cordis.patch.yml",
+        "./presets/dev-plan.patch.yml",
+        "./presets/scout.patch.yml",
+        "./presets/scribe.patch.yml"
+      ]
+    }
+  }
+}
