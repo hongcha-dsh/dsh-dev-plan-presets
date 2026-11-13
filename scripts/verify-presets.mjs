@@ -18,7 +18,7 @@
  * 依赖：js-yaml。优先借用本机 DSH profile 里的副本。
  */
 
-import { readFileSync, existsSync, writeFileSync, mkdirSync, rmSync } from 'node:fs'
+import { readFileSync, existsSync, writeFileSync, mkdirSync, rmSync, cpSync, openSync, closeSync } from 'node:fs'
 import { join, dirname, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { createRequire } from 'node:module'
@@ -97,8 +97,19 @@ export function loadData(root = ROOT, yaml = loadYaml()) {
   }
 
   const pkgText = readText('package.json')
-  const pkg = pkgText ? JSON.parse(pkgText) : {}
-  const patchList = Array.isArray(pkg.dsh?.bundle?.patch) ? [...pkg.dsh.bundle.patch] : []
+  let pkg = {}
+  let pkgError = null
+  if (pkgText === null) {
+    pkgError = 'package.json 不存在'
+  } else {
+    try {
+      pkg = JSON.parse(pkgText)
+    } catch (error) {
+      pkgError = error instanceof Error ? error.message : String(error)
+      pkg = {}
+    }
+  }
+  const patchList = Array.isArray(pkg?.dsh?.bundle?.patch) ? [...pkg.dsh.bundle.patch] : []
 
   const files = {}
   for (const rel of REQUIRED_FILES) files[rel] = readText(rel)
@@ -133,7 +144,7 @@ export function loadData(root = ROOT, yaml = loadYaml()) {
     }
   }
 
-  return { root, pkg, patchList, files, parsed, rows, yaml }
+  return { root, pkg, pkgText, pkgError, patchList, files, parsed, rows, yaml }
 }
 
 const flatten = (plugins, out = []) => {
@@ -163,9 +174,11 @@ export function findSubagentRow(data, toolName) {
 export function checksFor(data) {
   const results = []
   const check = (ok, label, detail = '') => results.push({ ok: Boolean(ok), label, detail: String(detail) })
-  const { pkg, patchList, files, parsed, rows, yaml } = data
+  const { pkg, pkgText, pkgError, patchList, files, parsed, rows, yaml } = data
 
   // ── 打包层 ────────────────────────────────────────────────────────────────
+  check(typeof pkgText === 'string', 'package.json 存在')
+  check(pkgError === null, 'package.json 是合法 JSON', pkgError ?? '')
   check(pkg.name === 'dsh-dev-plan-presets', 'package.json name', pkg.name)
   check(pkg.version === '0.1.0', 'package.json version', pkg.version)
   check(pkg.private === true, 'package.json private=true')
@@ -259,8 +272,12 @@ export function checksFor(data) {
   }
 
   const devPlanSuffix = findPersonaRow(data, 'dev-plan')?.config?.suffix ?? ''
-  check(/来源/.test(devPlanSuffix), 'dev-plan suffix 要求引用外部证据时标明来源')
-  check(!/任何消息都不得宣称执行过/.test(devPlanSuffix), 'dev-plan suffix 不再一刀切禁止引用外部测试结论')
+  check(
+    /可以引用/.test(devPlanSuffix) && /执行窗口/.test(devPlanSuffix) && /来源/.test(devPlanSuffix),
+    'dev-plan suffix 允许注明来源地引用执行窗口结论',
+  )
+  check(/不得声称自己执行/.test(devPlanSuffix), 'dev-plan suffix 禁止本预设谎称自己执行过')
+  check(!/任何消息都不得宣称执行过/.test(devPlanSuffix), 'dev-plan suffix 没有一刀切禁止引用外部测试结论')
 
   // ── compaction 形状 ───────────────────────────────────────────────────────
   for (const id of ['dev-plan', 'scout', 'scribe']) {
@@ -480,11 +497,156 @@ const MUTATIONS = [
       fsRow.config.write = true
     },
   },
+  {
+    name: 'dev-plan suffix 被改成禁止引用任何外部测试结论',
+    expect: 'suffix 允许注明来源地引用执行窗口结论',
+    mutate(data) {
+      const persona = findPersonaRow(data, 'dev-plan')
+      persona.config.suffix = '任何消息都不得宣称执行过测试，也不得引用执行窗口提供的测试结论。\n'
+    },
+  },
 ]
 
 function runSyntaxCheck(file) {
   const result = spawnSync(process.execPath, ['--check', file], { stdio: 'ignore' })
   return { ok: result.status === 0, status: result.status, error: result.error?.message }
+}
+
+/** 跑一个 node 子进程，stdout/stderr 直接写入文件（不用管道，避免受限沙箱的 EPERM）。 */
+function runNodeToFile(args, cwd, env, logFile) {
+  const fd = openSync(logFile, 'w')
+  try {
+    const result = spawnSync(process.execPath, args, { cwd, env, stdio: ['ignore', fd, fd] })
+    return { status: result.status, error: result.error?.message }
+  } finally {
+    closeSync(fd)
+  }
+}
+
+function copyBundle(dest) {
+  const EXCLUDED_TOP = new Set(['.git', '.verify-tmp', '.verify-copies', '.verify-log.txt'])
+  cpSync(ROOT, dest, {
+    recursive: true,
+    filter: (src) => {
+      const rel = src.slice(ROOT.length).replace(/^[\\/]/, '')
+      if (rel === '') return true
+      return !EXCLUDED_TOP.has(rel.split(/[\\/]/)[0])
+    },
+  })
+}
+
+function runVerifyEntry(dir) {
+  const logFile = join(dir, '.verify-log.txt')
+  const result = runNodeToFile(
+    [join(dir, 'scripts', 'verify-presets.mjs')],
+    dir,
+    { ...process.env, VERIFY_SKIP_SELFCHECK: '1' },
+    logFile,
+  )
+  let output = ''
+  try {
+    output = readFileSync(logFile, 'utf8')
+  } catch {
+    output = ''
+  }
+  return { status: result.status, output, error: result.error }
+}
+
+const BROKEN_INDEX = 'export function apply(ctx) {\n  const x = {\n\n'
+
+/**
+ * 真实文件层自检：在隔离副本里改坏真实文件，用**同一个验证入口**跑，而不是只检查一个生产代码永远不读的临时文件。
+ * 第 2 项是元测试：把代码层闸门整体改为恒通过，若坏文件仍被检出，说明第 1 项的结论不是闸门给的。
+ */
+function runSelfChecks() {
+  const items = []
+  // 只为元元测试保留一层递归：再深的副本不再跑自检
+  const depth = Number(process.env.VERIFY_SELFCHECK_DEPTH ?? '0')
+  // 副本必须放在包目录之外：cpSync 不允许把目录复制进它自己的子目录
+  const base = join(dirname(ROOT), '.verify-copies')
+  rmSync(base, { recursive: true, force: true })
+  mkdirSync(base, { recursive: true })
+  try {
+    const brokenDir = join(base, 'broken-index')
+    copyBundle(brokenDir)
+    writeFileSync(join(brokenDir, 'index.js'), BROKEN_INDEX, 'utf8')
+    const broken = runVerifyEntry(brokenDir)
+    items.push({
+      name: '隔离副本写坏真实 index.js，同一验证入口检出',
+      ok: broken.status !== 0 && broken.output.includes('node --check index.js：FAIL'),
+      detail: `exit=${broken.status}${broken.error ? `, ${broken.error}` : ''}`,
+    })
+
+    const gateDir = join(base, 'no-code-layer')
+    copyBundle(gateDir)
+    writeFileSync(join(gateDir, 'index.js'), BROKEN_INDEX, 'utf8')
+    const verifyPath = join(gateDir, 'scripts', 'verify-presets.mjs')
+    const gateSource = readFileSync(verifyPath, 'utf8')
+    // 带换行与缩进定位，避免命中本函数里的匹配字符串
+    const syntaxPatched = gateSource.replace(
+      '\n  const syntax = runSyntaxCheck(indexFile)',
+      '\n  const syntax = { ok: true }',
+    )
+    const smokePatched = syntaxPatched.replace(
+      '\n    const mod = await import(moduleUrl)',
+      '\n    const mod = { apply: () => {} }',
+    )
+    const patched = syntaxPatched !== gateSource && smokePatched !== syntaxPatched
+    writeFileSync(verifyPath, smokePatched, 'utf8')
+    const gate = patched ? runVerifyEntry(gateDir) : { status: null, error: '闸门替换未命中' }
+    items.push({
+      name: '删掉代码层闸门后坏 index.js 不再被检出（证明闸门承重）',
+      ok: patched && gate.status === 0,
+      detail: patched ? `exit=${gate.status}` : gate.error,
+    })
+
+    const pkgDir = join(base, 'broken-package-json')
+    copyBundle(pkgDir)
+    writeFileSync(join(pkgDir, 'package.json'), '{ "name": "dsh-dev-plan-presets", "version": ', 'utf8')
+    const pkgRun = runVerifyEntry(pkgDir)
+    const cleanFail = pkgRun.output.includes('FAIL  package.json 是合法 JSON')
+    const hasStack = /\n\s+at\s|SyntaxError/.test(pkgRun.output)
+    items.push({
+      name: '坏 package.json 干净 FAIL（无堆栈）',
+      ok: pkgRun.status !== 0 && cleanFail && !hasStack,
+      detail: `exit=${pkgRun.status}, 命中FAIL=${cleanFail}, 堆栈=${hasStack}`,
+    })
+
+    // 4) 元元测试：在副本里删掉代码层闸门后，让副本自己的自检照常运行 →
+    //    自检第 1 项无法再检出坏 index.js，于是总体验证必须失败（证明自检本身承重）
+    if (depth < 1) {
+      const blindDir = join(base, 'gate-removed-selfcheck')
+      copyBundle(blindDir)
+      const blindVerifyPath = join(blindDir, 'scripts', 'verify-presets.mjs')
+      const blindSource = readFileSync(blindVerifyPath, 'utf8')
+      const blindPatched = blindSource
+        .replace('\n  const syntax = runSyntaxCheck(indexFile)', '\n  const syntax = { ok: true }')
+        .replace('\n    const mod = await import(moduleUrl)', '\n    const mod = { apply: () => {} }')
+      writeFileSync(blindVerifyPath, blindPatched, 'utf8')
+      const blindLog = join(blindDir, '.verify-log.txt')
+      const blind = runNodeToFile(
+        [blindVerifyPath],
+        blindDir,
+        { ...process.env, VERIFY_SELFCHECK_DEPTH: String(depth + 1) },
+        blindLog,
+      )
+      let blindOut = ''
+      try {
+        blindOut = readFileSync(blindLog, 'utf8')
+      } catch {
+        blindOut = ''
+      }
+      const blindPatchedOk = blindPatched !== blindSource
+      items.push({
+        name: '删掉代码层闸门后总体验证失败（自检失去检出能力）',
+        ok: blindPatchedOk && blind.status !== 0 && blindOut.includes('隔离副本写坏真实 index.js'),
+        detail: blindPatchedOk ? `exit=${blind.status}` : '闸门替换未命中',
+      })
+    }
+  } finally {
+    rmSync(base, { recursive: true, force: true })
+  }
+  return items
 }
 
 async function main() {
@@ -529,6 +691,7 @@ async function main() {
   // 变异检查
   let detected = 0
   const missed = []
+  const detectedNames = []
   for (const mutation of MUTATIONS) {
     const mutated = clone(data)
     try {
@@ -539,26 +702,24 @@ async function main() {
     }
     const outcome = checksFor(mutated).filter((item) => !item.ok)
     const hit = outcome.some((item) => item.label.includes(mutation.expect))
-    if (hit) detected += 1
-    else missed.push(`${mutation.name}（期望 ${mutation.expect} 报错，实际未报）`)
+    if (hit) {
+      detected += 1
+      detectedNames.push(mutation.name)
+    } else missed.push(`${mutation.name}（期望 ${mutation.expect} 报错，实际未报）`)
   }
 
-  // index.js 语法错误必须被 node --check 抓到
-  const tmpDir = join(ROOT, '.verify-tmp')
-  let syntaxMutationOk = false
-  try {
-    mkdirSync(tmpDir, { recursive: true })
-    const badFile = join(tmpDir, 'bad-index.mjs')
-    writeFileSync(badFile, 'export function apply(ctx) {\n  const x = {\n\n', 'utf8')
-    syntaxMutationOk = runSyntaxCheck(badFile).ok === false
-  } finally {
-    rmSync(tmpDir, { recursive: true, force: true })
+  // 自检（真实文件层）：默认跑；嵌套调用时跳过，避免递归
+  const selfChecks = process.env.VERIFY_SKIP_SELFCHECK === '1' ? [] : runSelfChecks()
+  for (const item of selfChecks) {
+    if (item.ok) {
+      detected += 1
+      detectedNames.push(item.name)
+    } else missed.push(`${item.name}（${item.detail}）`)
   }
-  if (syntaxMutationOk) detected += 1
-  else missed.push('写坏 index.js 语法（node --check 未报错）')
 
-  const totalMutations = MUTATIONS.length + 1
+  const totalMutations = MUTATIONS.length + selfChecks.length
   console.log(`负向变异：${detected}/${totalMutations} 检出`)
+  if (VERBOSE) for (const name of detectedNames) console.log(`PASS  变异：${name}`)
   for (const item of missed) console.log(`FAIL  ${item}`)
 
   const ok = failures === 0 && syntax.ok && smokeOk && missed.length === 0

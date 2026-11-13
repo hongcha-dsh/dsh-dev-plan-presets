@@ -32,9 +32,10 @@
 ## 二、实际可见工具面（重要，别当成隔离）
 
 DSH 的 preset 只决定「这个角色挂载哪些插件行」，**不是全局工具白名单**。
-本机实测：`standard` preset 没声明 fs 行，但会话里仍会出现 base / web 层注入的
-`working_directory`；profile 里的 `dsh-config-manager` 还会向**每个** Agent（含子代理）
-注入 `config_backup`、`config_restore`、`config_sync_*`、`config_import_*` 等工具，无 `when` 过滤。
+`standard` 本身就是完整工具面：它自己声明了 `tool-fs`、`tool-fs-search` 等文件工具，那些读写能力来自声明。
+但 `working_directory` 不来自任何 preset 声明——它由 base 层的 `dsh-tool-working-directory` **全局注入**，preset 不声明它也会出现。
+profile 里的 `dsh-config-manager` 还会向**每个** Agent（含子代理）注入 `config_backup`、`config_restore`、
+`config_sync_*`、`config_import_*` 等 9 个工具，无 `when` 过滤。
 
 所以三个角色的真实处境是：
 
@@ -131,10 +132,31 @@ node scripts/verify-presets.mjs        # 或 npm run verify
 
 它检查声明层面：3 个 preset、id/order、工具面（dev-plan 无 fs/搜索/Shell、scout 只读、scribe 只读写）、
 三个委派入口的名字 / `agentPreset` 绑定 / 精确 `provider` 与 `model`、`maxDepth: 1`、
-persona 必需方法论与关键禁令标记、compaction 组的 `isolate` 形状、exports 指向真实文件、打包清单；
-并跑 `node --check`、`index.js` 的 import + `apply()` smoke，以及一组**负向变异**：
-把模型改错、清空 persona、删掉 `isolate`、引用缺失 patch、删掉桥接例外标记、写坏 index.js 语法——
-每一种都必须让检查报 FAIL，否则视为检查失效。
+persona 必需方法论与关键禁令标记、`suffix` 的事实归属（允许注明来源地引用执行窗结论、禁止谎称自己执行过）、
+compaction 组的 `isolate` 形状、exports 指向真实文件、打包清单；
+并跑 `node --check`、`index.js` 的 import + `apply()` smoke。
+
+它还会跑**负向变异**，每一种都必须让检查报 FAIL，否则视为检查失效：
+
+| # | 变异 | 期望捕获点 |
+|---|---|---|
+| 1 | recon 的 model 改成非低成本模型 | 精确 model 断言 |
+| 2 | recon 的 provider 改错 | 精确 provider 断言 |
+| 3 | 清空 dev-plan persona | persona 实质内容断言 |
+| 4 | 删掉 compaction 的 `isolate` | isolate 形状断言 |
+| 5 | 引用一个不存在的 patch | 补丁存在性断言 |
+| 6 | 删掉桥接例外标记 `rework_task` | persona 标记断言 |
+| 7 | 把 scout 的 `write` 打开 | scout 只读断言 |
+| 8 | 把 dev-plan suffix 改成禁止引用任何外部测试结论 | suffix 允许引用断言 |
+
+另有 4 项**真实文件自检**（不是改内存数据）：
+
+| # | 自检 | 证明什么 |
+|---|---|---|
+| 9 | 在隔离副本里写坏**真实的** `index.js`，用同一个验证入口跑 | 真实文件层错误会被同一个入口拦住（exit≠0，日志含 `node --check index.js：FAIL`） |
+| 10 | 元测试：在同一副本里把代码层闸门（`node --check` + import smoke）整体改为恒通过，再放坏 `index.js` | 坏文件之所以会被第 9 项检出，靠的就是这道闸门；若删掉检查后坏文件仍被检出，说明第 9 项的结论不是闸门给的 → 元测试判失败 |
+| 11 | 在隔离副本里写坏 `package.json` | 报 `FAIL  package.json 是合法 JSON` 并正常退出，不抛堆栈 |
+| 12 | 元元测试：在副本里删掉代码层闸门，让副本**自己的自检**照常跑 | 删掉闸门后总体验证必须失败（第 9 项失去检出能力）；否则说明自检是空转 |
 
 **它不能证明运行期行为**，以下必须手动看一次：
 
@@ -151,7 +173,7 @@ persona 必需方法论与关键禁令标记、compaction 组的 `isolate` 形�
 
 ### 状态说明
 
-**已做**：静态声明检查 182 项 + `node --check` + `import`/`apply()` smoke + 8 个负向变异（全部通过）；YAML/JSON 可解析；文件清单齐全。
+**已做**：静态声明检查 185 项 + `node --check` + `import`/`apply()` smoke + 12 项负向变异/自检（8 项数据层变异 + 4 项真实文件自检，全部检出）；YAML/JSON 可解析；文件清单齐全。
 **未做**：本包尚未安装到任何 profile，**没有运行期实测**——上面的勾选项都还没打勾。
 
 ---
@@ -162,7 +184,7 @@ persona 必需方法论与关键禁令标记、compaction 组的 `isolate` 形�
 2. **scribe 的路径纪律是软约束。** preset 机制不能按路径限定 `write`；只能靠 persona 规定"只写规划/复核文档" + 回执给出实际路径供审计。它物理上仍能写工作区内的任意文件。
 3. **复核没有 Shell。** 不能 `git show`、不能跑测试、不能构建。只给 commit id 时必须由你（或执行窗口）提供 diff / 文件 / 测试输出。
 4. **模型路由受现有模型钉影响。** 本机 `dsh-subagent-model-pin`（`honorExplicit: false`）会覆盖显式路由；两者目标一致时无冲突，但**以模型钉为准**。如果哪天卸掉模型钉，`agentOptions` 仍会兜底到 flash；若连 profile 里都没有该 provider/model，委派会在创建子代理时失败。
-5. **子代理不会继承父 preset 的工具限制**，它们只按自己 preset 挂载的行拿工具；这也是本设计成立的前提。
+5. **子代理有自己的预设作用域，但仍会继承全局注入的工具。** 它们不继承父 preset 挂载的行，却同样会看到 `config_*`、`working_directory` 这类全局工具；scout / scribe 的「只读」「只写文档」同样靠 persona 禁止 + 回执审计，不是硬隔离。
 6. **不继承官方 preset 更新。** 这是独立声明，DSH 升级后若 `standard` 的基础行变化（新增必填配置字段等），本包需要人工跟一次。
 7. **`scout` / `scribe` 会出现在预设选择器里。** DSH 无法隐藏 preset；它们名字标了「内部角色」，请勿单独开会话使用。
 8. **全局与项目 `AGENTS.md` 仍会注入**（这是好事，但意味着你的全局规则对 `dev-plan` 同样生效）。
