@@ -80,16 +80,31 @@ profile 里的 `dsh-config-manager` 还会向**每个** Agent（含子代理）�
 - 本包是 **bundle**，`bundles` 顺序必须在 `@deepseek-ai/dsh-web-app` **之后**（preset 注册表由 web-app 提供）。
 - 不改任何现有 preset（`standard` 保持原样），也不改默认选择。
 
-### 路径说明
+### 路径说明（2026-11-14 起）
 
-- **当前副本位置（暂存）**：`D:\DeepSeek Harness\.tmp-dev-plan-presets\dsh-dev-plan-presets`
-  —— 因实施沙箱无法写插件区，本包先在这里完成与静态验证。
-- **正式目标位置**：`D:\ai工作区\技术专家\plugins\dsh-dev-plan-presets`
-  —— 安装前把整个目录复制过去（保留 `.git`），下面的命令与依赖路径都按正式位置写。
+- **正式安装目录 = 当前唯一源**：`D:\ai工作区\技术专家\plugins\dsh-dev-plan-presets`
+  已从历史暂存副本复制完成；静态验证、git 提交与后续修改都在这里做。
+- **历史暂存副本（仅存档 / 重装参考）**：`D:\DeepSeek Harness\.tmp-dev-plan-presets\dsh-dev-plan-presets`
+  不是当前源，不要在这里改；它只说明本包当初在沙箱里先落盘的位置。
 
-### 步骤
+### 安装状态（2026-11-14，已发生，不是待办）
 
-1. 先把暂存副本复制到正式插件目录：
+- 已通过插件管理器安装到 desktop profile：`plugin_manager install_bundle`，target
+  `link:D:\ai工作区\技术专家\plugins\dsh-dev-plan-presets`，返回
+  `enabled=true, changed=true, application=applied`，版本 `0.1.0`，无 warnings。
+- `list_bundles` 显示本包 `enabled / installed`，四行 `dev-plan-presets` / `preset-dev-plan` /
+  `preset-scout` / `preset-scribe` 均出现，各自 `entryId` 含对应行。
+- profile 的 `package.json` 已含依赖
+  `"dsh-dev-plan-presets": "link:D:/ai工作区/技术专家/plugins/dsh-dev-plan-presets"`，
+  `dsh.profile.bundles` 中本包位于 `@deepseek-ai/dsh-web-app` 之后（数组末尾）。
+- 默认预设注册表仍是 `standard`（`agent-preset-registry` 的 `default` / `selectedDefault` 均未变）。
+- 安装已 `applied`，**本次没有重启应用**：**新建会话**的预设选择器应能看到「开发规划」；
+  若选择器没刷新，才由用户决定是否重启 DSH。**当前已存在的旧会话不会因此切换 preset**——
+  不要期待本对话变成 `dev-plan` 或出现新工具。
+
+### 步骤（首次安装 / 迁移重装时参考；正式目录已就绪，不要重复覆盖）
+
+1. 复制目录（历史步骤，只在重建或迁移时使用）：
 
 ```powershell
 Copy-Item -Recurse 'D:\DeepSeek Harness\.tmp-dev-plan-presets\dsh-dev-plan-presets' 'D:\ai工作区\技术专家\plugins\dsh-dev-plan-presets'
@@ -115,10 +130,11 @@ Copy-Item -Recurse 'D:\DeepSeek Harness\.tmp-dev-plan-presets\dsh-dev-plan-prese
 }
 ```
 
-3. 安装并重启 DSH（bundle 的补丁在启动时装配，不支持热加载）。
-4. 新建会话 → 预设选择器里选「开发规划」。**不要**把内部角色 `scout` / `scribe` 当普通会话用（它们没有对话所需的完整能力，只是被调用方）。
+3. 安装：优先走插件管理器（本次即由管理器热应用，**无需重启**）；若手工修改 profile 的
+   `package.json` / `bundles`，bundle 补丁在启动时装配，需要重启 DSH 才生效。
+4. **新建会话** → 预设选择器里选「开发规划」。**不要**把内部角色 `scout` / `scribe` 当普通会话用（它们没有对话所需的完整能力，只是被调用方）。
 
-> 也可以走插件管理页安装本包；但 profile 的 `bundles` 顺序仍以数组末尾为准。
+> 无论哪种方式，profile 的 `bundles` 顺序都以数组末尾（`@deepseek-ai/dsh-web-app` 之后）为准。
 
 ---
 
@@ -158,9 +174,27 @@ compaction 组的 `isolate` 形状、exports 指向真实文件、打包清单�
 | 11 | 在隔离副本里写坏 `package.json` | 报 `FAIL  package.json 是合法 JSON` 并正常退出，不抛堆栈 |
 | 12 | 元元测试：在副本里删掉代码层闸门，让副本**自己的自检**照常跑 | 删掉闸门后总体验证必须失败（第 9 项失去检出能力）；否则说明自检是空转 |
 
-**它不能证明运行期行为**，以下必须手动看一次：
+### 安装后验证记录（2026-11-14）
 
-- [ ] 新建会话的预设选择器里出现「开发规划」，`standard` 仍是默认值。
+正式目录（`D:\ai工作区\技术专家\plugins\dsh-dev-plan-presets`）复跑：
+
+| 项 | 结果 |
+|---|---|
+| `node scripts/verify-presets.mjs` | **PASS**：185 通过 / 0 失败 |
+| `node --check index.js` | **PASS** |
+| `import` + `apply()` smoke | **PASS**（无告警） |
+| 负向变异 / 真实文件自检 | **12/12 检出**（8 数据层 + 4 真实文件） |
+| profile 依赖 | `link:D:/ai工作区/技术专家/plugins/dsh-dev-plan-presets`（只读核对） |
+| `bundles` 顺序 | 在 `@deepseek-ai/dsh-web-app` 之后（数组末尾，只读核对） |
+| 默认 preset 注册表 | `standard`（未变，只读核对） |
+| 插件管理器 | `enabled / applied`，`0.1.0`，无 warnings |
+
+### 仍需运行期验收（尚未执行，不得写成已通过）
+
+**静态自检不能证明运行期行为**；安装 `applied` 也只证明装配成功。以下必须在**新建会话**里手动看一遍
+（旧会话不会切换 preset，见第四节）：
+
+- [ ] 新建会话的预设选择器里出现「开发规划」「内部角色 · 只读侦察」「内部角色 · 文档记录」，`standard` 仍是默认值。
 - [ ] 选 `dev-plan` 后，列出**实际工具清单**，并分成「本 preset 声明的」与「全局注入的」两栏。
       预期：声明的只有 `ask_user_question` / `recon` / `review` / `scribe` / `send_message` / `list_agents` / `interrupt_agent`；
       若清单里同时出现 `working_directory`、`config_*` 等全局注入项，即第二节的说法属实（本机预期会出现）。
@@ -170,11 +204,15 @@ compaction 组的 `isolate` 形状、exports 指向真实文件、打包清单�
 - [ ] 只给一个 commit id 时，它要求你贴 diff，而不是假装看过。
 - [ ] 让它写一份设计稿：`scribe` 写入指定路径，回执给出绝对路径与字节数；工作区外写入被沙箱拒绝时它如实报告。
 - [ ] 复核一个已知正确的改动：可以零问题通过；复核一个含缺陷的改动：给出位置 + 证据 + 可验收的修复要求。
+- [ ] 装了 `dsh-planner-worker` 时：`ask_worker` 默认不用、不自动派发/返工；未装时手工流程同样完整。
 
 ### 状态说明
 
-**已做**：静态声明检查 185 项 + `node --check` + `import`/`apply()` smoke + 12 项负向变异/自检（8 项数据层变异 + 4 项真实文件自检，全部检出）；YAML/JSON 可解析；文件清单齐全。
-**未做**：本包尚未安装到任何 profile，**没有运行期实测**——上面的勾选项都还没打勾。
+**已做（2026-11-14）**：静态声明检查 185 项 + `node --check` + `import`/`apply()` smoke + 12 项负向变异/自检；
+正式目录复制完成并通过复跑验证；插件管理器安装 `applied`（0.1.0，无 warnings）；
+profile 依赖 / `bundles` 顺序 / 默认 registry 只读核对。
+**未做**：上节运行期清单全部未执行（新会话选择器、实际工具清单、真实子代理路由、scribe 沙箱写入、规划/复核行为），
+**没有任何运行期实测结论**——不得把上述项写成已通过。
 
 ---
 
@@ -224,3 +262,4 @@ compaction 组的 `isolate` 形状、exports 指向真实文件、打包清单�
 ## 十、版本
 
 - v0.1.0（2026-11-13）：三 preset 静态组合（`dev-plan` / `scout` / `scribe`）、内置风险驱动规划与静态复核方法论、三个角色化委派入口、可选桥接规则、静态自检脚本（含负向变异）。
+- 2026-11-14（安装记录，未改包版本）：正式目录 `D:\ai工作区\技术专家\plugins\dsh-dev-plan-presets` 经插件管理器安装到 desktop profile（`applied`，`0.1.0`，无 warnings）；README 补充路径现状、安装状态与剩余人工验收清单。未改 persona、验证脚本、默认 preset、桥接或模型钉。
