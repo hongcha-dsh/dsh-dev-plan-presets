@@ -1,10 +1,11 @@
 /**
  * dsh-dev-plan-presets — bundle 入口
  *
- * 本包的价值全在 presets/*.patch.yml 的三份 Agent preset 声明里。
+ * 本包的价值全在 presets/dev-plan.patch.yml 的那一份 Agent preset 声明里
+ * （原内部角色已不再是独立 preset，角色约束以模板形式写在 dev-plan persona 内）。
  * 这个 index.js **不注册任何模型可见工具、不注册 HTTP 路由、不注入提示词**：
  *   1. 让 bundle 在插件管理页有一行，能被看见、禁用、卸载；
- *   2. 加载时做一次打包自检（四个 patch 文件在不在、能不能读出三个 preset id），
+ *   2. 加载时做一次打包自检（两个 patch 文件在不在、能不能读出 dev-plan preset id），
  *      缺文件只告警，绝不让 Host 启动失败。
  *
  * 设计取舍见 README「已知限制」：这是纯静态组合（B 方案），不是安全沙箱。
@@ -18,11 +19,9 @@ const PLUGIN_DIR = fileURLToPath(new URL('.', import.meta.url))
 const PATCH_FILES = [
   'cordis.patch.yml',
   'presets/dev-plan.patch.yml',
-  'presets/scout.patch.yml',
-  'presets/scribe.patch.yml',
 ]
 
-const EXPECTED_PRESETS = ['dev-plan', 'scout', 'scribe']
+const EXPECTED_PRESETS = ['dev-plan']
 
 export function apply(ctx) {
   const warn = (message) => {

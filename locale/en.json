@@ -1,7 +1,7 @@
 {
   "meta": {
     "title": "Dev plan & review",
-    "description": "An expensive main model that only plans and statically reviews: recon, traversal and web lookups go to the read-only scout, document writes go to scribe. Ships a plan or a review verdict, never implements.",
+    "description": "An expensive main model that only plans and statically reviews: recon, lookups and document writes go to standard subagents carrying a role template; ships a plan or a review verdict, never implements. Standard keeps its full tool surface; templates are task-level prompt constraints, not tool or permission isolation.",
     "detail": "detail.md"
   }
 }
