@@ -59,18 +59,31 @@ DSH 的 preset 只决定角色挂载哪些插件行，**不是全局工具白名
 - 不做 `scribe` 的路径白名单：preset 机制没有按路径限写的开关。
 - 不改 `standard`、不改默认 preset、不改桥接插件与模型钉、不改插件 `askLimit`。
 
-## 六、未验证项（本机尚未安装，故以下均为"待实测"）
+## 六、未验证项（安装已 applied；以下为运行期待验）
 
-- [ ] bundle 装载后三个 preset 是否真的出现在选择器，`order` 10/90/91 的排序是否正确。
+2026-11-14 安装与静态复核（已发生，不是待办）：
+
+- 已通过 `plugin_manager install_bundle` 安装到 desktop profile：target
+  `link:D:\ai工作区\技术专家\plugins\dsh-dev-plan-presets`，返回
+  `enabled=true, changed=true, application=applied`，版本 `0.1.0`，无 warnings。
+- 正式目录复跑 `node scripts/verify-presets.mjs`：**PASS**——静态声明检查 185 通过 / 0 失败，
+  `node --check index.js` PASS，`import` + `apply()` smoke PASS（无告警），负向变异 **12/12 检出**。
+- 以上只证明**装配成功 + 声明/代码层自检**，**不证明运行期行为**；安装 `applied` 也不等于运行期通过。
+
+以下运行期项**仍未验收**（全部未打勾，不得写成已通过）：
+
+- [ ] 新建会话的预设选择器：三个 preset 是否出现、`order` 10/90/91 的排序是否正确、`standard` 是否仍为默认。
 - [ ] `dev-plan` 会话的**实际**工具清单：声明的七个 + 全局注入的 `working_directory` / `config_*`，并确认 persona 禁止后模型不会调用。
 - [ ] `agentOptions` 与 `dsh-subagent-model-pin`（`honorExplicit: false`）并存时，子会话实际路由是否仍为 `dsh-opencode-go / deepseek-v4.1-flash`。
 - [ ] profile 缺少该 provider/model 时，委派是否在创建子代理时失败（而非静默继承贵模型）。
-- [ ] `agentPreset: scout` 在委派时能否正确解析（未知 id 只在调用时报错，加载时不报）。
+- [ ] `agentPreset: scout` / `scribe` 在委派时能否正确解析（未知 id 只在调用时报错，加载时不报）。
 - [ ] 三个 `cordis:group` 压缩行在同一个 agent 作用域内多次挂载是否无冲突。
 - [ ] `scribe` 在 workspace-write 沙箱下对项目目录的写入是否被允许，越界时错误是否可读。
+- [ ] 规划/复核行为：`recon` 是否先读后判、`review` 是否给出位置 + 证据 + 可验收的修复要求、`scribe` 回执是否给出绝对路径与字节数。
 - [ ] 插件管理页是否显示本包一行，且详细文档来自本文件（`meta.detail`）。
 
 ## 七、静态验证
 
 `node scripts/verify-presets.mjs`：声明层合同 + `node --check` + `import`/`apply()` smoke + 负向变异。
-它只覆盖**声明与脚本自检**；运行期行为必须按 README「验证」的手工清单逐条确认。
+2026-11-14 在正式目录复跑 **PASS**：185 通过 / 0 失败，`node --check` 与 `import`/`apply()` smoke 通过，负向变异 12/12 检出。
+它仍只覆盖**声明与脚本自检**；运行期行为必须按 README「验证」的手工清单逐条确认。
