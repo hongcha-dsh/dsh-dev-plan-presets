@@ -1,36 +1,55 @@
 {
   "name": "dsh-dev-plan-presets",
-  "version": "0.2.0",
-  "private": true,
+  "version": "0.3.0",
+  "private": false,
+  "license": "MIT",
   "type": "module",
-  "description": "DSH 开发规划预设：昂贵主模型只做规划与静态复核；查证/遍历/落盘交给 standard 子代理，角色约束由 dev-plan 在每次派遣时以固定模板附带（纯静态组合）。",
+  "description": "开发规划与交付 preset：昂贵主模型只做规划、派工与复核；develop 子代理负责施工并直接汇报主窗口。施工方式可从宿主已安装的 DSH 预设中选择，服务商与模型从宿主目录联动选择；模型守门默认只管理「开发规划与交付」会话派出的子代理，主会话永不守门。",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hongcha-dsh/dsh-dev-plan-presets.git"
+  },
   "exports": {
     ".": "./index.js",
+    "./client": "./client.js",
+    "./preset": "./preset.js",
+    "./settings": "./settings.js",
     "./package.json": "./package.json",
     "./cordis.patch.yml": "./cordis.patch.yml",
-    "./presets/dev-plan.patch.yml": "./presets/dev-plan.patch.yml",
     "./locale/*.json": "./locale/*.json",
-    "./icon": "./icon.svg"
+    "./icon": "./icon.svg",
+    "./docs/flow-redesign.md": "./docs/flow-redesign.md"
   },
   "files": [
     "index.js",
+    "preset.js",
+    "settings.js",
+    "guard.js",
+    "client.js",
     "cordis.patch.yml",
-    "presets/dev-plan.patch.yml",
     "locale/*.json",
     "icon.svg",
     "README.md",
     "detail.md",
-    "scripts/verify-presets.mjs"
+    "docs",
+    "LICENSE",
+    "scripts",
+    "test"
   ],
   "scripts": {
-    "verify": "node scripts/verify-presets.mjs"
+    "verify": "node scripts/verify-presets.mjs",
+    "test": "node --test --experimental-test-isolation=none"
+  },
+  "engines": {
+    "dsh": ">=0.2.2-rc.3"
   },
   "dsh": {
     "bundle": {
-      "patch": [
-        "./cordis.patch.yml",
-        "./presets/dev-plan.patch.yml"
-      ]
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true
     }
   }
 }

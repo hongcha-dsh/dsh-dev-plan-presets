@@ -1,273 +1,96 @@
 #!/usr/bin/env node
 /**
- * verify-presets.mjs — 静态合同自检（不启动 DSH、不安装、不改 profile）
+ * verify-presets.mjs — 0.3.0 合同自检（不启动 DSH、不安装、不改 profile）
  *
- * 覆盖四层：
- *   1. 声明层：只注册一个 dev-plan preset；三个委派实例绑定 standard、工具面、精确模型路由、
- *      compaction 形状；两个角色模板（侦察/复核、文书）与派遣绑定；已删除的 scout/scribe 无残留。
- *      关键允许/禁止边界用精确整句、编号规则与邻近语境断言，避免“词语在别处出现”就算通过。
- *   2. 打包层：exports 指向真实文件且不再暴露 scout/scribe、dsh.bundle.patch 完整、files 覆盖。
- *   3. 代码层：node --check + 动态 import + apply() smoke。
- *   4. 变异层：故意改坏关键点（含 5 个“关键词还在、语义被改坏”的模板变异），断言检查确实会 FAIL。
+ * 覆盖五层：
+ *   1. 打包层：package.json / exports / files / bundle patch / client manifest；
+ *   2. 声明层：动态 preset 的四个委派工具、任意可用预设与回退、主窗工具面、persona 合同；
+ *   3. 代码层：node --check + 真实模块 import + 假 ctx 驱动动态注册/守门/设置路由；
+ *   4. 文档层：README / detail / locale 必须写清回退、迁移、模型守门与未验证项；
+ *   5. 变异层：故意改坏关键点，断言上文检查确实会 FAIL（不是只写 smoke）。
  *
- * 它不能证明运行期行为（preset 是否出现在选择器、子代理是否真的用低成本模型、
- * 模板是否真的被逐字附带、standard 子代理实际注入了哪些工具）。那部分见 README「验证」的手工清单。
+ * 它不能证明运行期宿主行为（preset 是否出现在选择器、子会话是否真的使用目标模型、
+ * 设置页在真实 GUI 中是否渲染）。那部分见 README「验证」的手工清单。
  *
  * 用法：
  *   node scripts/verify-presets.mjs
  *   node scripts/verify-presets.mjs --verbose
  *
- * 依赖：js-yaml。优先借用本机 DSH profile 里的副本。
+ * 本脚本不依赖 js-yaml / @deepseek-ai/*，也不启动任何服务器。
  */
 
-import {
-  readFileSync,
-  readdirSync,
-  writeFileSync,
-  mkdirSync,
-  rmSync,
-  cpSync,
-  openSync,
-  closeSync,
-} from 'node:fs'
-import { join, dirname, resolve } from 'node:path'
+import { readFileSync, existsSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
+import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
-import { createRequire } from 'node:module'
 import { spawnSync } from 'node:child_process'
+import { loadModules, createFakeContext, createFakeRegistry, createFakeWebServer, createFakeConfigEditor, createFakeAgent, callRoute } from './test-harness.mjs'
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
 const VERBOSE = process.argv.includes('--verbose')
-const EXPECTED_ROUTE = { provider: 'dsh-opencode-go', model: 'deepseek-v4.1-flash' }
-const REMOVED_PRESET_IDS = ['scout', 'scribe']
-
+const RUNTIME_FILES = ['index.js', 'preset.js', 'settings.js', 'guard.js', 'client.js']
 const REQUIRED_FILES = [
   'package.json',
   'index.js',
+  'preset.js',
+  'settings.js',
+  'guard.js',
+  'client.js',
   'cordis.patch.yml',
-  'presets/dev-plan.patch.yml',
-  'README.md',
-  'detail.md',
-  'icon.svg',
   'locale/zh.json',
   'locale/en.json',
+  'icon.svg',
+  'README.md',
+  'detail.md',
+  'docs/flow-redesign.md',
+  'LICENSE',
   'scripts/verify-presets.mjs',
-  '.gitignore',
+  'test/plugin.test.mjs',
 ]
+const SOCIAL_FILES = ['README.md', 'detail.md', 'LICENSE']
 
-// 方案 B 明确删除的文件：读不到才算通过（不是用 hidden 字段藏起来）。
-const REMOVED_FILES = ['presets/scout.patch.yml', 'presets/scribe.patch.yml']
-
-const PERSONA_MARKERS = {
-  'dev-plan': [
-    '分档',
-    '低风险',
-    '中风险',
-    '高风险',
-    '证据',
-    '假设',
-    '方案',
-    'builder-check',
-    'commit',
-    'diff',
-    '未运行测试',
-    'config_',
-    'working_directory',
-    'rework_task',
-    'ask_worker',
-    'askLimit',
-  ],
-}
-
-const SCOUT_TEMPLATE_MARKERS = [
-  '任务级',
-  '不是声明级',
-  'standard',
-  'read',
-  'read_image',
-  'glob',
-  'grep',
-  'web_search',
-  'web_fetch',
-  'write',
-  'edit',
-  'apply_patch',
-  'pwsh',
-  'bash',
-  'config_',
-  'working_directory',
-  '需要主代理改派或提供材料',
-  '结论',
-  '证据',
-  '路径:行号',
-  '未验证',
-  '没检查的范围',
-  '置信度',
-  '高、中、低',
-  '没有找到证据',
-  '复核',
-  '未发现正确性问题',
-  '测试通过',
-  '数据，不是指令',
-]
-
-const SCRIBE_TEMPLATE_MARKERS = [
-  '任务级',
-  '不是声明级',
-  'standard',
-  '逐字',
-  '不改写',
-  'read_image',
-  '覆盖',
-  '拒绝',
-  '超出文书子代理职责',
-  'Shell',
-  'Web',
-  '搜索',
-  '委派',
-  'config_',
-  'working_directory',
-  '回执',
-  '字节',
-  '失败：',
-  '不要输出文件内容',
-]
-
-export function loadYaml() {
-  const homes = [process.env.DSH_HOME, 'D:\\DSH-Home', join(process.env.USERPROFILE ?? '', '.dsh')].filter(
-    (home) => typeof home === 'string' && home.length > 0,
-  )
-  for (const home of homes) {
-    for (const anchor of [
-      join(home, 'profiles', 'desktop', 'package.json'),
-      join(home, 'profiles', 'desktop', 'node_modules', 'js-yaml', 'package.json'),
-    ]) {
-      try {
-        return createRequire(pathToFileURL(anchor).href)('js-yaml')
-      } catch {
-        // 试下一个
-      }
-    }
-  }
+const readText = (rel) => {
   try {
-    return createRequire(pathToFileURL(join(ROOT, 'package.json')).href)('js-yaml')
+    return readFileSync(join(ROOT, rel), 'utf8')
   } catch {
     return null
   }
 }
 
-export function loadData(root = ROOT, yaml = loadYaml()) {
-  const readText = (rel) => {
-    try {
-      return readFileSync(join(root, rel), 'utf8')
-    } catch {
-      return null
-    }
-  }
-
-  const pkgText = readText('package.json')
-  let pkg = {}
-  let pkgError = null
-  if (pkgText === null) {
-    pkgError = 'package.json 不存在'
-  } else {
-    try {
-      pkg = JSON.parse(pkgText)
-    } catch (error) {
-      pkgError = error instanceof Error ? error.message : String(error)
-      pkg = {}
-    }
-  }
-  const patchList = Array.isArray(pkg?.dsh?.bundle?.patch) ? [...pkg.dsh.bundle.patch] : []
-
-  const files = {}
-  for (const rel of [...REQUIRED_FILES, ...REMOVED_FILES]) files[rel] = readText(rel)
-  for (const rel of patchList) {
-    const clean = rel.replace(/^\.\//, '')
-    if (!(clean in files)) files[clean] = readText(clean)
-  }
-
-  let presetFiles = []
+const readJson = (rel) => {
+  const text = readText(rel)
+  if (text === null) return { value: null, error: `${rel} 不存在` }
   try {
-    presetFiles = readdirSync(join(root, 'presets'))
-      .filter((name) => name.endsWith('.patch.yml'))
-      .sort()
-  } catch {
-    presetFiles = []
+    return { value: JSON.parse(text), error: null }
+  } catch (error) {
+    return { value: null, error: `${rel} 不是合法 JSON：${error instanceof Error ? error.message : String(error)}` }
   }
-
-  const parsed = {}
-  const rows = []
-  // 给每一行打上来源补丁，供“生产断言必须指向实际 presets/dev-plan.patch.yml”检查使用。
-  // 只是普通自有属性（字符串），能安全通过 clone 的 JSON 往返。
-  const pushRow = (row, source) => {
-    if (row && typeof row === 'object' && !Array.isArray(row)) row._source = source
-    rows.push(row)
-  }
-  if (yaml) {
-    for (const rel of patchList) {
-      const clean = rel.replace(/^\.\//, '')
-      const text = files[clean]
-      if (typeof text !== 'string') {
-        parsed[rel] = { status: 'missing' }
-        continue
-      }
-      try {
-        const value = yaml.load(text, { schema: yaml.DEFAULT_SCHEMA })
-        parsed[rel] = { status: 'ok', value }
-        if (Array.isArray(value)) {
-          for (const row of value) {
-            if (Array.isArray(row?.insert)) for (const child of row.insert) pushRow(child, clean)
-            else pushRow(row, clean)
-          }
-        } else {
-          parsed[rel] = { status: 'not-array', value }
-        }
-      } catch (error) {
-        parsed[rel] = { status: 'parse-error', error: error instanceof Error ? error.message : String(error) }
-      }
-    }
-  }
-
-  return { root, pkg, pkgText, pkgError, patchList, files, presetFiles, parsed, rows, yaml }
 }
 
-const flatten = (plugins, out = []) => {
-  for (const plugin of plugins ?? []) {
-    out.push(plugin)
-    if (Array.isArray(plugin?.config)) flatten(plugin.config, out)
+const flattenPlugins = (plugins, out = []) => {
+  for (const row of plugins ?? []) {
+    out.push(row)
+    if (Array.isArray(row?.config)) flattenPlugins(row.config, out)
   }
   return out
 }
-const byName = (rows, name) => rows.filter((row) => row?.name === name)
-const pluginNames = (rows) => rows.map((row) => row?.name).filter(Boolean)
 
-export function findPresetRow(data, id) {
-  return data.rows.find((row) => row?.name === '@deepseek-ai/dsh-agent-preset' && row?.config?.id === id)
-}
-export function findPersonaRow(data, id) {
-  const preset = findPresetRow(data, id)
-  return flatten(preset?.config?.plugins).find((row) => row?.name === '@deepseek-ai/dsh-persona')
-}
-export function findSubagentRow(data, toolName) {
-  const preset = findPresetRow(data, 'dev-plan')
-  return flatten(preset?.config?.plugins).find(
+const findPresetPlugin = (definition, id) => (definition?.plugins ?? []).find((row) => row?.id === id)
+const findTool = (definition, toolName) =>
+  flattenPlugins(definition?.plugins).find(
     (row) => row?.name === '@deepseek-ai/dsh-tool-subagent' && row?.config?.toolName === toolName,
   )
-}
 
-/** 从 persona 文本里按稳定标记取出角色模板正文；取不到返回 null。 */
-export function extractTemplate(text, name) {
+const extractTemplate = (text, name) => {
   if (typeof text !== 'string') return null
-  const re = new RegExp(
+  const expression = new RegExp(
     `^[ \\t]*=+ ROLE-TEMPLATE:${name}:BEGIN =+[ \\t]*\\r?\\n([\\s\\S]*?)^[ \\t]*=+ ROLE-TEMPLATE:${name}:END =+[ \\t]*$`,
     'm',
   )
-  const match = re.exec(text)
+  const match = expression.exec(text)
   return match ? match[1] : null
 }
 
-/** 把模板里的“规则：”编号行解析成 {编号 → 整行正文}，用于按编号做精确断言。 */
-export function numberedRules(text) {
+const numberedRules = (text) => {
   const rules = new Map()
   for (const line of String(text ?? '').split(/\r?\n/)) {
     const match = /^\s*(\d+)\.\s+(.+?)\s*$/.exec(line)
@@ -276,352 +99,319 @@ export function numberedRules(text) {
   return rules
 }
 
-export function checksFor(data) {
+const globCovers = (pattern, rel) => {
+  if (!pattern.includes('*')) {
+    const directory = pattern.replace(/\/+$/, '')
+    return pattern === rel || rel.startsWith(`${directory}/`)
+  }
+  const [prefix, suffix] = pattern.split('*')
+  return rel.startsWith(prefix) && rel.endsWith(suffix)
+}
+
+const fileCovered = (patterns, rel) => (patterns ?? []).some((pattern) => globCovers(String(pattern), rel))
+
+/** 读取待检查面（真实文件 + 真实模块构建出的两个 definition）。 */
+export async function loadSurface() {
+  const pkgRead = readJson('package.json')
+  const localeZh = readJson('locale/zh.json')
+  const localeEn = readJson('locale/en.json')
+  const files = {}
+  for (const rel of [...new Set([...REQUIRED_FILES, ...SOCIAL_FILES, ...RUNTIME_FILES])]) {
+    files[rel] = readText(rel)
+  }
+  const modules = await loadModules(ROOT)
+  const base = { ...modules.settings.DEFAULT_SETTINGS }
+  const standardMode = modules.preset.resolveDevelopMode({ requestedMode: 'standard' })
+  const fallbackMode = modules.preset.resolveDevelopMode({
+    requestedMode: 'deep-ptc',
+    presets: [],
+    catalogChecked: true,
+  })
+  const deepPtcMode = modules.preset.resolveDevelopMode({
+    requestedMode: 'deep-ptc',
+    presets: [{ id: 'deep-ptc', name: '深度 PTC' }],
+    catalogChecked: true,
+  })
+  const customMode = modules.preset.resolveDevelopMode({
+    requestedMode: 'team-builder',
+    presets: [{ id: 'team-builder', name: '团队施工' }],
+    catalogChecked: true,
+  })
+  const selfMode = modules.preset.resolveDevelopMode({
+    requestedMode: 'dev-plan',
+    presets: [{ id: 'dev-plan', name: '开发规划与交付' }],
+    catalogChecked: true,
+  })
+  const standard = modules.preset.buildPresetDefinition({ settings: base, mode: standardMode })
+  const fallback = modules.preset.buildPresetDefinition({ settings: base, mode: fallbackMode })
+  const deepPtc = modules.preset.buildPresetDefinition({ settings: base, mode: deepPtcMode })
+  const custom = modules.preset.buildPresetDefinition({ settings: base, mode: customMode })
+  const withEffort = modules.preset.buildPresetDefinition({
+    settings: { ...base, childReasoningEffort: 'high' },
+    mode: standardMode,
+  })
+  return {
+    root: ROOT,
+    pkg: pkgRead.value,
+    pkgError: pkgRead.error,
+    pkgText: readText('package.json'),
+    patchText: readText('cordis.patch.yml'),
+    locale: { zh: localeZh.value, en: localeEn.value },
+    localeErrors: { zh: localeZh.error, en: localeEn.error },
+    readme: readText('README.md'),
+    detail: readText('detail.md'),
+    files,
+    modules,
+    standard,
+    fallback,
+    deepPtc,
+    custom,
+    selfFallback: selfMode,
+    withEffort,
+    constants: {
+      presetId: modules.preset.PRESET_ID,
+      presetName: modules.preset.PRESET_NAME,
+      order: modules.preset.PRESET_ORDER,
+      deepPtcId: modules.preset.DEEP_PTC_PRESET_ID,
+    },
+  }
+}
+
+/** 纯检查：给定 surface，返回 { ok, label, detail } 列表。 */
+export function checksFor(surface) {
   const results = []
   const check = (ok, label, detail = '') => results.push({ ok: Boolean(ok), label, detail: String(detail) })
-  const { pkg, pkgText, pkgError, patchList, files, presetFiles, parsed, rows, yaml } = data
+  const { pkg, pkgError, files, standard, fallback, deepPtc, custom, withEffort, readme, detail, locale } = surface
 
   // ── 打包层 ────────────────────────────────────────────────────────────────
-  check(typeof pkgText === 'string', 'package.json 存在')
   check(pkgError === null, 'package.json 是合法 JSON', pkgError ?? '')
-  check(pkg.name === 'dsh-dev-plan-presets', 'package.json name', pkg.name)
-  check(pkg.version === '0.2.0', 'package.json version=0.2.0（scout/scribe 移除属破坏性变更）', pkg.version)
-  check(pkg.private === true, 'package.json private=true')
-  check(pkg.type === 'module', 'package.json type=module')
+  check(pkg?.name === 'dsh-dev-plan-presets', 'package.json name', pkg?.name)
+  check(pkg?.version === '0.3.0', 'package.json version=0.3.0', pkg?.version)
+  check(pkg?.type === 'module', 'package.json type=module')
+  check(pkg?.private === false, 'package.json private=false（可开源发布）', String(pkg?.private))
+  check(pkg?.license === 'MIT', 'package.json license=MIT', pkg?.license)
+  check(pkg?.engines?.dsh === '>=0.2.2-rc.3', 'package.json engines.dsh 为已验证基线 >=0.2.2-rc.3', String(pkg?.engines?.dsh))
 
-  const exportsMap = pkg.exports ?? {}
+  const patch = pkg?.dsh?.bundle?.patch
+  const patchList = Array.isArray(patch) ? patch : patch === undefined ? [] : [patch]
+  check(patchList.length === 1, 'dsh.bundle.patch 只有 1 个补丁', JSON.stringify(patch))
+  check(patchList[0] === './cordis.patch.yml', 'dsh.bundle.patch 指向 cordis.patch.yml', String(patchList[0]))
+  check(pkg?.dsh?.client?.platform === 'web', 'dsh.client.platform=web')
+  check(pkg?.dsh?.client?.immediately === true, 'dsh.client.immediately=true')
+
+  const exportsMap = pkg?.exports ?? {}
+  for (const required of ['.', './client', './preset', './settings', './package.json', './cordis.patch.yml', './locale/*.json', './icon']) {
+    check(Object.hasOwn(exportsMap, required), `exports 暴露 ${required}`)
+  }
   for (const [key, target] of Object.entries(exportsMap)) {
     if (typeof target !== 'string') {
       check(false, `exports ${key} 是字符串`, typeof target)
       continue
     }
     const clean = target.replace(/^\.\//, '')
-    const samples = clean.includes('*')
-      ? Object.keys(files).filter((rel) => {
-          const [prefix, suffix] = clean.split('*')
-          return rel.startsWith(prefix) && rel.endsWith(suffix)
-        })
+    const candidates = clean.includes('*')
+      ? Object.keys(files).filter((rel) => globCovers(clean, rel))
       : [clean]
     check(
-      samples.length > 0 && samples.every((rel) => typeof files[rel] === 'string'),
-      `exports ${key} 指向真实存在的文件`,
-      samples.join(', ') || '无匹配文件',
+      candidates.length > 0 && candidates.every((rel) => files[rel] !== null && files[rel] !== undefined),
+      `exports ${key} 指向真实文件`,
+      candidates.join(', ') || '无匹配',
     )
   }
-  check(exportsMap['./package.json'] === './package.json', 'exports 暴露 ./package.json')
+  check(exportsMap['.'] === './index.js', 'exports . 指向 index.js', exportsMap['.'])
+  check(exportsMap['./client'] === './client.js', 'exports ./client 指向 client.js', exportsMap['./client'])
 
-  const staleExportKeys = Object.keys(exportsMap).filter((key) => /scout|scribe/i.test(key))
-  check(staleExportKeys.length === 0, 'exports 不再包含 scout/scribe 入口', staleExportKeys.join(', ') || '无')
-  const staleFiles = (pkg.files ?? []).filter((rel) => /scout|scribe/i.test(String(rel)))
-  check(staleFiles.length === 0, 'files 清单不再包含 scout/scribe', staleFiles.join(', ') || '无')
-  const stalePatchRefs = patchList.filter((rel) => /scout|scribe/i.test(String(rel)))
-  check(stalePatchRefs.length === 0, 'dsh.bundle.patch 不再包含 scout/scribe', stalePatchRefs.join(', ') || '无')
+  const runtimeFiles = [...RUNTIME_FILES, 'cordis.patch.yml', 'locale/zh.json', 'locale/en.json', 'icon.svg', 'README.md', 'detail.md', 'docs/flow-redesign.md', 'LICENSE']
+  for (const rel of runtimeFiles) check(fileCovered(pkg?.files, rel), `files 覆盖 ${rel}`, rel)
+  for (const rel of REQUIRED_FILES) check(files[rel] !== null, `文件存在：${rel}`)
 
-  check(Array.isArray(patchList) && patchList.length === 2, 'dsh.bundle.patch 是含 2 个补丁的数组', JSON.stringify(patchList))
-  for (const rel of patchList) {
-    const clean = rel.replace(/^\.\//, '')
-    check(typeof files[clean] === 'string', `补丁文件存在：${rel}`)
-    const patterns = pkg.files ?? []
-    const covered = patterns.some((pattern) =>
-      pattern.includes('*')
-        ? clean.startsWith(pattern.slice(0, pattern.indexOf('*'))) &&
-          clean.endsWith(pattern.slice(pattern.indexOf('*') + 1))
-        : pattern === clean,
-    )
-    check(covered, `files 覆盖：${rel}`)
-  }
-  for (const rel of REQUIRED_FILES) {
-    check(typeof files[rel] === 'string', `文件存在：${rel}`)
-  }
-  for (const rel of REMOVED_FILES) {
-    check(files[rel] === null, `已删除的补丁文件不存在：${rel}`)
-  }
-  check(
-    JSON.stringify(presetFiles) === JSON.stringify(['dev-plan.patch.yml']),
-    'presets 目录只剩 dev-plan.patch.yml',
-    presetFiles.join(', ') || '空',
-  )
+  check(!existsSync(join(ROOT, 'presets/dev-plan.patch.yml')), '旧的静态 preset 补丁已删除')
+  check(!/\bjs-yaml\b|\byaml\b/.test(String(pkg?.dependencies ?? {})) && !/\bjs-yaml\b/.test(String(pkg?.devDependencies ?? {})), '不依赖 js-yaml')
+  check(!Object.keys(pkg?.dependencies ?? {}).some((name) => /deep-ptc|deep_ptc/.test(name)), '不依赖 deep-ptc 包')
+  check(!Object.keys(pkg?.dependencies ?? {}).length, '运行期零 dependencies', Object.keys(pkg?.dependencies ?? {}).join(', '))
+  check(!/\b@deepseek-ai\//.test(String((pkg?.peerDependencies ?? {}))) && !/\b@deepseek-ai\//.test(String((pkg?.dependencies ?? {}))), '不声明 @deepseek-ai/* 依赖')
 
-  // ── YAML 解析 ─────────────────────────────────────────────────────────────
-  if (!yaml) {
-    check(false, '能加载 js-yaml')
-    return results
-  }
-  for (const rel of patchList) {
-    const entry = parsed[rel]
-    check(
-      entry?.status === 'ok',
-      `YAML 可解析且顶层是数组：${rel}`,
-      entry?.status === 'parse-error' ? entry.error : entry?.status,
-    )
-  }
-  // 关键合同断言必须落在实际发布文件上，而不是任何测试夹具/临时数据。
-  check(
-    parsed['./presets/dev-plan.patch.yml']?.status === 'ok',
-    '生产断言直接读取实际 presets/dev-plan.patch.yml',
-    parsed['./presets/dev-plan.patch.yml']?.status ?? 'missing',
-  )
-  check(
-    findPresetRow(data, 'dev-plan')?._source === 'presets/dev-plan.patch.yml',
-    'dev-plan preset 行来自 presets/dev-plan.patch.yml（不是夹具）',
-    String(findPresetRow(data, 'dev-plan')?._source),
-  )
+  // ── 根补丁：只挂根插件 ────────────────────────────────────────────────────
+  const patchText = String(surface.patchText ?? '')
+  // 只看非注释行：说明文字里出现 @deepseek-ai/dsh-agent-preset 是允许的。
+  const patchActiveText = patchText
+    .split(/\r?\n/)
+    .filter((line) => !/^\s*#/.test(line))
+    .join('\n')
+  check(/id:\s*dev-plan-presets/.test(patchActiveText), '根补丁挂 dev-plan-presets 行')
+  check(/name:\s*dsh-dev-plan-presets/.test(patchActiveText), '根补丁 name=dsh-dev-plan-presets')
+  check(!/@deepseek-ai\/dsh-agent-preset/.test(patchActiveText), '根补丁不再静态注册 dsh-agent-preset')
+  check(!/preset-dev-plan|preset-scout|preset-scribe/.test(patchActiveText), '根补丁没有旧 preset-* 行')
+  check(!/scout|scribe/i.test(patchActiveText), '根补丁不引用 scout/scribe')
+  check(/developMode:\s*standard/.test(patchText), '根补丁默认 developMode=standard')
+  check(/modelGuardMode:\s*pin/.test(patchText), '根补丁默认 modelGuardMode=pin')
+  check(/guardAllSubagents:\s*false/.test(patchText), '根补丁默认 guardAllSubagents=false')
+  check(/childProvider:\s*dsh-opencode-go/.test(patchText), '根补丁默认 provider=dsh-opencode-go')
+  check(/childModel:\s*deepseek-v4\.1-flash/.test(patchText), '根补丁默认 model=deepseek-v4.1-flash')
 
-  // ── preset 声明：只注册 dev-plan ──────────────────────────────────────────
-  const presetRows = byName(rows, '@deepseek-ai/dsh-agent-preset')
-  const presets = new Map()
-  for (const row of presetRows) {
-    const id = row?.config?.id
-    check(typeof id === 'string' && id.length > 0, 'preset 声明有 config.id', String(id))
-    if (typeof id === 'string') presets.set(id, row.config)
-  }
-  check(presetRows.length === 1 && presets.size === 1, '只注册 1 个 preset', [...presets.keys()].join(', '))
-  check(
-    JSON.stringify([...presets.keys()]) === JSON.stringify(['dev-plan']),
-    '唯一注册的 preset 是 dev-plan',
-    [...presets.keys()].join(', '),
-  )
-  for (const id of REMOVED_PRESET_IDS) {
-    check(!presets.has(id), `不再注册 preset：${id}`)
-  }
-  check(
-    !rows.some((row) => row?.id === 'preset-scout' || row?.id === 'preset-scribe'),
-    '没有遗留 preset-scout / preset-scribe 注册行',
-  )
-
-  const selfRow = rows.find((row) => row?.name === pkg.name)
-  check(Boolean(selfRow), '根补丁把本包挂成插件行', selfRow?.id ?? 'missing')
-
-  const devPlan = presets.get('dev-plan')
-  check(devPlan?.order === 10, 'dev-plan order=10', String(devPlan?.order))
-  check(typeof devPlan?.name === 'string' && devPlan.name.length > 0, 'dev-plan 有展示名称')
-  check(typeof devPlan?.description === 'string' && devPlan.description.length > 0, 'dev-plan 有描述')
-  check(Array.isArray(devPlan?.plugins) && devPlan.plugins.length > 0, 'dev-plan 有 plugins 列表')
-  check(devPlan?.id === 'dev-plan', 'dev-plan config.id 与查表键一致')
-
-  // ── persona 合同 ──────────────────────────────────────────────────────────
-  const persona = findPersonaRow(data, 'dev-plan')
-  const personaText = persona?.config?.prefix ?? ''
-  const personaSuffix = persona?.config?.suffix ?? ''
-  check(Boolean(persona), 'dev-plan 挂载 persona')
-  check(
-    typeof persona?.config?.prefix === 'string' && persona.config.prefix.length > 400,
-    'dev-plan persona.prefix 是实质内容（>400 字符）',
-    `${persona?.config?.prefix?.length ?? 0} chars`,
-  )
-  check(
-    typeof personaSuffix === 'string' && personaSuffix.length > 0,
-    'dev-plan persona.suffix 非空（否则会遮蔽部署级 suffix）',
-  )
-  check(persona?.config?.complete !== true, 'dev-plan 未使用 complete:true')
-  check(!/\{\{/.test(`${personaText}${personaSuffix}`), 'dev-plan persona 不含模板变量')
-
-  const missing = (PERSONA_MARKERS['dev-plan'] ?? []).filter((marker) => !`${personaText}${personaSuffix}`.includes(marker))
-  check(missing.length === 0, 'dev-plan persona 包含必需方法论/禁令标记', `缺：${missing.join(', ') || '无'}`)
-  check(
-    !/不是[\u201c"]被要求不要用/.test(personaText),
-    'dev-plan persona 没有“不是被要求不要用”这类错误硬保证',
-  )
-
-  check(
-    /可以引用/.test(personaSuffix) && /执行窗口/.test(personaSuffix) && /来源/.test(personaSuffix),
-    'dev-plan suffix 允许注明来源地引用执行窗口结论',
-  )
-  check(/不得声称自己执行/.test(personaSuffix), 'dev-plan suffix 禁止本预设谎称自己执行过')
-  check(
-    !/任何消息都不得宣称执行过/.test(personaSuffix),
-    'dev-plan suffix 没有一刀切禁止引用外部测试结论',
-  )
-
-  // ── 两个角色模板（scout / scribe 的新载体）──────────────────────────────────
-  const scoutTemplate = extractTemplate(personaText, 'SCOUT')
-  const scribeTemplate = extractTemplate(personaText, 'SCRIBE')
-  check(
-    typeof scoutTemplate === 'string' && scoutTemplate.length > 300,
-    '侦察/复核角色模板存在且完整（含首尾标记）',
-    `${scoutTemplate?.length ?? 0} chars`,
-  )
-  check(
-    typeof scribeTemplate === 'string' && scribeTemplate.length > 200,
-    '文书角色模板存在且完整（含首尾标记）',
-    `${scribeTemplate?.length ?? 0} chars`,
-  )
-  check(
-    /任务级/.test(scoutTemplate ?? '') &&
-      /不是声明级/.test(scoutTemplate ?? '') &&
-      /任务级/.test(scribeTemplate ?? '') &&
-      /不是声明级/.test(scribeTemplate ?? ''),
-    '两个模板都声明自己是任务级提示词约束、不是声明级隔离',
-  )
-
-  for (const [name, template, markers] of [
-    ['侦察/复核', scoutTemplate, SCOUT_TEMPLATE_MARKERS],
-    ['文书', scribeTemplate, SCRIBE_TEMPLATE_MARKERS],
+  // ── 代码层：只允许宿主解析、不得手改 profile ───────────────────────────────
+  const indexSource = String(files['index.js'] ?? '')
+  const presetSource = String(files['preset.js'] ?? '')
+  const settingsSource = String(files['settings.js'] ?? '')
+  const guardSource = String(files['guard.js'] ?? '')
+  const clientSource = String(files['client.js'] ?? '')
+  for (const [name, source] of [
+    ['index.js', indexSource],
+    ['preset.js', presetSource],
+    ['settings.js', settingsSource],
+    ['guard.js', guardSource],
   ]) {
-    const absent = markers.filter((marker) => !(template ?? '').includes(marker))
-    check(absent.length === 0, `${name}模板保留必需标记清单（关键词层）`, `缺：${absent.join(', ') || '无'}`)
+    check(!/from\s+['"]@deepseek-ai\//.test(source), `${name} 不 import @deepseek-ai/*（link 安装可解析）`)
+    check(!/from\s+['"](?:js-yaml|yaml)['"]/.test(source), `${name} 不 import yaml 解析器`)
   }
+  check(/ctx\.inject\(\['agentPresets'\]/.test(indexSource), 'index.js 通过 ctx.inject 等待 agentPresets')
+  check(/registry\.register\(definition\)/.test(indexSource), 'index.js 真的调用 agentPresets.register')
+  check(/await unregister\(\)/.test(indexSource) && /child\.effect/.test(indexSource), '动态 preset disposer 交还给 ctx.effect')
+  check(/agent\/created/.test(guardSource), '模型守门监听 agent/created')
+  check(/agent\/pre-step/.test(guardSource), '模型守门监听 agent/pre-step')
+  check(/kind:\s*'reject'/.test(guardSource), '模型守门越界返回 reject')
+  check(/cancel\(\{\s*kind:\s*'user'/.test(guardSource), '模型守门越界 cancel 子代理')
+  check(/parent\?\.inject|parent\.inject/.test(guardSource), '模型守门通知父会话')
+  check(/parentSession/.test(guardSource) && /origin === 'subagent'/.test(guardSource), '模型守门只认子代理 header')
+  check(/agent\/disposed/.test(guardSource), '模型守门监听 agent/disposed 清理 step guard')
   check(
-    (scoutTemplate ?? '').includes('未发现正确性问题') && (scoutTemplate ?? '').includes('测试通过'),
-    '侦察/复核模板保留复核零问题通过与“不谎称测试通过”规则',
+    /guardAllSubagents !== true/.test(guardSource) && /presetForSession/.test(guardSource),
+    'guard 默认按父会话 dev-plan 限制，并优先用 presetForSession',
   )
   check(
-    (scribeTemplate ?? '').includes('逐字') && (scribeTemplate ?? '').includes('超出文书子代理职责'),
-    '文书模板保留逐字写入与越界拒绝规则',
+    /header\.origin === 'subagent'/.test(guardSource) &&
+      /delegationDepth/.test(guardSource) &&
+      !/if \(header\.parentSession\) return true/.test(guardSource),
+    'guard 只认 origin=subagent 或 delegationDepth>0，不把 fork 主对话当子代理',
   )
+  check(
+    /MODEL_CATALOG_TTL_MS = 60_000/.test(indexSource) &&
+      /modelCatalogSnapshot/.test(indexSource) &&
+      !/await loadModelCatalog/.test(indexSource),
+    '模型目录使用 60s 快照 + 后台刷新，不阻塞 /state',
+  )
+  check(/const steps = new Map\(\)/.test(guardSource), '模型守门按 agent 跟踪 step guard disposer')
+  check(/for \(const dispose of pending\)/.test(guardSource), '模型守门总 disposer 卸载所有已装 step guard')
+  check(/configEditor/.test(indexSource) && /editor\.edit/.test(indexSource), '设置保存走 configEditor.edit')
+  check(!/cordis\.patch\.yml/.test(indexSource), 'Host 代码不手改 profile 的 cordis.patch.yml')
+  check(/originProblem/.test(indexSource) && /sec-fetch-site/.test(indexSource), 'Host 配置写路由做 Origin/Sec-Fetch-Site 校验')
+  check(/webServer\.getOrigin\(\)/.test(indexSource), 'Host 配置写路由使用 webServer.getOrigin() 权威 origin')
+  check(/origin-not-authoritative/.test(indexSource), 'Host 配置写路由拒绝非监听 Origin')
+  check(/LOOPBACK_HOSTS/.test(indexSource), 'Host 配置写路由仅对 loopback 别名做有限等价')
+  check(!/restartRequired/.test(indexSource), 'Host 保存成功不再误报 restartRequired')
+  check(/mediaTypeOf\(req\) !== 'application\/json'/.test(indexSource), 'Host 配置写路由只接受 application/json')
+  for (const code of ['unsupported-media-type', 'forbidden-origin', 'invalid-config', 'config-editor-unavailable']) {
+    check(indexSource.includes(`'${code}'`), `Host 配置写路由返回稳定 code ${code}`)
+  }
+  check(/errorCode: state\.error === null \? null : 'preset-registration-failed'/.test(indexSource), 'Host state 提供 registration 错误 code')
+  check(/guardAllSubagents:\s*false/.test(settingsSource), 'settings 默认 guardAllSubagents=false')
+  check(/probePresets/.test(indexSource) && /presets:\s*\{/.test(indexSource), 'Host 返回真实预设目录')
+  check(/listProviders\(\)/.test(indexSource) && /listModels\(provider\.id\)/.test(indexSource), 'Host 枚举 provider/model 目录')
+  check(/const failures = entries/.test(indexSource) && /failure:/.test(indexSource), 'Host 模型目录容忍单个 provider 失败')
 
-  // ── 角色模板：精确边界（词语在别处出现不算通过）────────────────────────────
-  // 允许清单按整句取集合，不用 includes('write')：write 在禁止段里也会出现。
-  const SCOUT_ALLOW = ['read', 'read_image', 'glob', 'grep', 'web_search', 'web_fetch']
-  const scoutAllowMatch = /允许使用的工具只有[：:]\s*([^。\n]+)。\s*除此之外的一切工具一律不得调用。/.exec(
-    scoutTemplate ?? '',
-  )
-  check(Boolean(scoutAllowMatch), '侦察/复核模板的允许工具清单是精确整句', scoutAllowMatch ? '命中' : '未命中')
-  const scoutAllow = scoutAllowMatch
-    ? scoutAllowMatch[1].split(/[、,，]/).map((item) => item.trim()).filter(Boolean)
-    : []
+  // ── client 设置页 ─────────────────────────────────────────────────────────
+  check(/__ModuleLoader__\.load/.test(clientSource), 'client.js 是浏览器模块')
+  check(/id:\s*'dsh-dev-plan-presets'/.test(clientSource), 'client.js 模块 id 正确')
+  check(/plugins\.row\.config/.test(clientSource), 'client.js 注册 plugins.row.config')
   check(
-    JSON.stringify(scoutAllow) === JSON.stringify(SCOUT_ALLOW),
-    '侦察/复核模板允许工具集合精确为六项（追加 write 即失败）',
-    scoutAllow.join(', ') || '空',
+    /key:\s*'dsh-dev-plan-presets#dev-plan-presets'/.test(clientSource),
+    'client 注册 key=dsh-dev-plan-presets#dev-plan-presets',
   )
+  check(/fetch\(API \+ '\/state'/.test(clientSource), 'client 读取 Host state 路由')
+  check(/fetch\(API \+ '\/config'/.test(clientSource) && /method:\s*'POST'/.test(clientSource), 'client 通过 Host 路由保存配置')
+  check(!/subagent-model-pin/.test(clientSource), 'client 不复用旧插件 id/路由')
+  for (const marker of ['developMode', 'childProvider', 'childModel', 'childReasoningEffort', 'modelGuardMode', 'killOnViolation', 'honorExplicit', 'audit', 'guardAllSubagents']) {
+    check(clientSource.includes(marker), `client 设置页包含字段 ${marker}`)
+  }
+  check(/state.presets/.test(clientSource) && /presetRows/.test(clientSource), 'client 从 /state 动态列出预设')
+  check(!/value: *'deep-ptc'/.test(clientSource), 'client 不再硬编码 deep-ptc 选项')
   check(
-    /你是只读侦察与复核子代理，负责为主代理取证。/.test(scoutTemplate ?? ''),
-    '侦察/复核模板明确“只读”定位（精确句）',
+    /state\.modelCatalog/.test(clientSource) &&
+      /modelChoices/.test(clientSource) &&
+      /providerChoices/.test(clientSource) &&
+      /presetChoices/.test(clientSource),
+    'client 从 /state 读取模型目录并用纯选择函数',
   )
+  check(/htmlFor/.test(clientSource) && /aria-describedby/.test(clientSource), 'client 使用 label for 与帮助文本关联')
+  check(/fieldset/.test(clientSource) && /legend/.test(clientSource), 'client 用 fieldset/legend 分组')
+  check(/type: *'button'/.test(clientSource), 'client 次级按钮显式 type=button')
+  check(!/configEditor/.test(clientSource), 'client 普通文案不出现 configEditor')
+  check(!/reasoningEffort（可空）/.test(clientSource), 'client 不把 reasoningEffort 当主标签')
+  check(/已回退 standard|Fell back to standard/.test(clientSource), 'client 显式显示回退 standard')
   check(
-    !/可写侦察|可写子代理|可以写文件|允许写文件/.test(scoutTemplate ?? ''),
-    '侦察/复核模板没有“可写”类反向表述',
-  )
-  check(
-    /需要写文件、改代码、跑命令、取 Git 历史、跑测试或构建时，不要绕路：在回传里写「需要主代理改派或提供材料」。写、Shell、Git、测试、构建都不属于你。/.test(
-      scoutTemplate ?? '',
-    ),
-    '侦察/复核模板对越界请求给出精确拒绝指令',
-  )
-
-  // 文书模板按编号规则断言：删掉某条规则或改写某条语义都会失败。
-  const scribeRules = numberedRules(scribeTemplate ?? '')
-  check(
-    scribeRules.size === 6,
-    '文书模板保留 6 条编号规则',
-    [...scribeRules.keys()].join(', ') || '空',
+    ['未安装', '未启用', '已被移除', '加载失败'].every((marker) => clientSource.includes(marker)),
+    'client 回退横幅涵盖不可用原因',
   )
   check(
-    /^只允许写规划与复核类文档（设计稿、实施计划、复核报告、决策记录）。/.test(scribeRules.get(3) ?? '') &&
-      /超出文书子代理职责/.test(scribeRules.get(3) ?? ''),
-    '文书模板规则 3 限定文档写入范围（改成任意文件即失败）',
-    scribeRules.get(3) ?? '缺',
+    clientSource.includes('not installed') && clientSource.includes('failed to load'),
+    'client 英文回退横幅涵盖不可用原因',
   )
   check(
-    /^不使用\s*Shell、Web、搜索与委派工具，也不要尝试替代。/.test(scribeRules.get(5) ?? ''),
-    '文书模板规则 5 精确禁止 Shell/Web/搜索/委派',
-    scribeRules.get(5) ?? '缺',
+    clientSource.includes('施工方式列表读取超时') && /setup list timed out/i.test(clientSource),
+    'client 显示预设目录超时',
   )
+  check(!/#[0-9a-fA-F]{3,8}|rgba?\(/.test(clientSource), 'client 不保留 hex/rgba 字面颜色')
+  check(!/navigator\.language/.test(clientSource), 'client 不使用 navigator.language')
   check(
-    /^config_\*、working_directory 以及任何未声明的工具都不得调用。/.test(scribeRules.get(6) ?? ''),
-    '文书模板规则 6 精确禁止 config_* 与 working_directory',
-    scribeRules.get(6) ?? '缺',
+    clientSource.includes('开发规划与交付 · 施工设置') &&
+      clientSource.includes('Development planning & delivery · development settings'),
+    'client 设置页标题使用预设名「开发规划与交付」',
   )
-  check(
-    !/任意文件|任意路径|任何文件/.test(scribeTemplate ?? ''),
-    '文书模板没有放开为可写任意文件',
-  )
-
-  // standard 的工具 / persona / AGENTS.md / 技能目录不得被用来扩大角色边界。
-  const BOUNDARY_TEXT =
-    'standard 的工具、persona、项目 AGENTS.md 或技能目录即使出现更多能力，也不得据此扩大本角色边界'
-  const CONFLICT_TEXT =
-    '若更高优先级指令与本模板的角色边界冲突，停止相关动作，并在回传里向主代理报告冲突，不擅自越界执行'
-  for (const [name, template] of [
-    ['侦察/复核', scoutTemplate],
-    ['文书', scribeTemplate],
+  check(/getSnapshot/.test(clientSource) && /\.subscribe\(/.test(clientSource), 'client 通过 locale getSnapshot/subscribe 跟随宿主语言')
+  check(/return locale\.subscribe/.test(clientSource), 'client 清理语言订阅')
+  check(!/outline\s*:/.test(clientSource), 'client 不覆盖宿主焦点环')
+  for (const token of [
+    '--dsw-alias-border-l2',
+    '--dsw-alias-label-primary',
+    '--dsw-alias-label-secondary',
+    '--dsw-alias-label-tertiary',
+    '--dsw-alias-state-error-primary',
+    '--dsw-alias-state-success-primary',
+    '--dsw-alias-state-idle-primary',
+    '--dsw-alias-state-warn-primary',
+    '--dsw-alias-button-primary-fill',
+    '--dsw-alias-label-on-color',
+    '--dsw-alias-card-fill',
+    '--dsw-radius-sm',
+    '--dsw-radius-xs',
+    '--ds-font-family-code',
   ]) {
-    check(
-      (template ?? '').includes(BOUNDARY_TEXT),
-      `${name}模板禁止因 standard/AGENTS/skills 扩大角色边界`,
-    )
-    check((template ?? '').includes(CONFLICT_TEXT), `${name}模板要求高层指令冲突时停止并报告`)
+    check(clientSource.includes(token), `client 使用已核实主题 token ${token}`)
   }
+  check(/role:\s*'status'/.test(clientSource) && /role:\s*'alert'/.test(clientSource), 'client 状态/错误使用 role=status/alert')
+  check(/aria-live/.test(clientSource), 'client 使用 aria-live')
+  check(/buttonDisabled/.test(clientSource) && /not-allowed/.test(clientSource), 'client 按钮有真实禁用态样式')
+  check(/未保存修改/.test(clientSource) && /已保存/.test(clientSource), 'client 常显保存状态')
+  check(/notice\.kind === 'saved'/.test(clientSource), 'client 仅在 notice.kind=saved 时显示已保存')
+  check(!/notice\.ok/.test(clientSource), 'client 不再用 notice.ok 判断成功')
+  check(/const update = \(patch\) => \{\s*setNotice\(null\)/.test(clientSource), 'client 修改字段时清除旧通知')
+  check(/kind:\s*'discarded'/.test(clientSource) && /已放弃修改/.test(clientSource), 'client 放弃修改有独立 kind/状态')
+  check(/无法连接 Host/.test(clientSource) && /Cannot reach the Host/.test(clientSource), 'client network 错误给可执行指引')
+  check(/仅 pin/.test(clientSource), 'client honorExplicit 标注仅 pin')
+  check(/hostFormatted/.test(clientSource) && /formatted \? raw :/.test(clientSource), 'client 不重复叠加“保存失败”前缀')
+  check(/放弃修改并刷新/.test(clientSource), 'client dirty 时刷新明确标记为放弃修改')
+  check(/设置路由未注册/.test(clientSource) && /settings route is not registered/i.test(clientSource), 'client 404 给出可执行指引')
+  check(/stopped\.current/.test(clientSource), 'client 连续 404 停止自动轮询')
+  check(/setTimeout\(refresh, 600\)/.test(clientSource) && /setTimeout\(refresh, 1800\)/.test(clientSource), 'client 保存后可在 HMR 404 后重试回读')
+  check(/registration === 'pending'/.test(clientSource) && /registration === 'failed'/.test(clientSource) && /registration === 'switching'/.test(clientSource), 'client 显示 pending/failed/switching 状态')
+  check(/施工方式/.test(clientSource) && /守门方式/.test(clientSource), 'client 两个模式 label 已区分')
+  check(/只记录，不阻止/.test(clientSource) && /记录详细日志/.test(clientSource), 'client 区分守门 audit 与审计日志开关')
+  check(/当前生效/.test(clientSource) && /保存后以回读值为准/.test(clientSource), 'client 展示当前生效路由与回读提示')
+  check(/overflowWrap/.test(clientSource), 'client 长原因可换行')
+  check(/inject:\s*\['slots',\s*'locale'\]/.test(clientSource), 'client 注入 slots 与 locale')
 
-  const dispatchSection = (() => {
-    const start = personaText.indexOf('## 角色模板')
-    const end = personaText.indexOf('===== ROLE-TEMPLATE:SCOUT:BEGIN')
-    return start >= 0 && end > start ? personaText.slice(start, end) : ''
-  })()
-  check(
-    dispatchSection.includes('AGENTS.md') &&
-      dispatchSection.includes('技能目录') &&
-      dispatchSection.includes('扩大角色边界') &&
-      dispatchSection.includes('停止相关动作') &&
-      dispatchSection.includes('报告冲突'),
-    '派遣纪律禁止因 standard/AGENTS/skills 扩大角色边界并要求报告冲突',
-    dispatchSection.length > 0 ? '命中' : '未找到派遣段',
-  )
-  check(
-    !/(用户\s*prompt|用户提示词)[^\n]{0,24}(优先|高于)[^\n]{0,24}(系统|persona|AGENTS)/i.test(personaText),
-    'persona 没有“用户 prompt 优先于系统/persona/AGENTS”的错误优先级声明',
-  )
+  // ── 动态 preset：standard ────────────────────────────────────────────────
+  const standardRows = flattenPlugins(standard?.plugins)
+  check(standard?.id === surface.constants.presetId, 'preset id=dev-plan', standard?.id)
+  check(standard?.id === 'dev-plan', 'preset id 保持 dev-plan')
+  check(standard?.name === '开发规划与交付', 'preset 显示名为「开发规划与交付」', standard?.name)
+  check(surface.constants.presetName === '开发规划与交付', 'PRESET_NAME=开发规划与交付', surface.constants.presetName)
+  check(standard?.order === 10, 'preset order=10', String(standard?.order))
+  check(typeof standard?.description === 'string' && standard.description.length > 0, 'preset 有动态 description')
+  check(/standard/.test(standard?.description ?? ''), '默认 description 写明 standard')
 
-  check(
-    /recon\s*与\s*review[^\n]*侦察\/复核角色模板/.test(personaText) &&
-      /scribe[^\n]*文书角色模板/.test(personaText),
-    '派遣指令分别绑定 recon/review 与 scribe',
-  )
-  check(
-    /每次调用都完整附带/.test(personaText) &&
-      /(不能|不得)省略/.test(personaText) &&
-      /以模板为准/.test(personaText) &&
-      /不放宽模板/.test(personaText),
-    '派遣纪律要求逐字附带、不得省略/改写、冲突以模板为准',
-  )
-  check(
-    /standard preset/.test(personaText) &&
-      /不是机制强制/.test(personaText) &&
-      /Shell/.test(personaText) &&
-      /写文件/.test(personaText),
-    'persona 诚实说明 standard 子代理拥有完整工具面、模板只是提示词约束',
-  )
-
-  // ── compaction 形状 ───────────────────────────────────────────────────────
-  const compactionRows = flatten(devPlan?.plugins)
-  const compactionGroup = compactionRows.find((row) => row?.id === 'compaction')
-  const compactionChildren = pluginNames(Array.isArray(compactionGroup?.config) ? compactionGroup.config : [])
-  check(Boolean(compactionGroup && compactionGroup.group === true), 'dev-plan compaction 是 group')
-  check(
-    compactionGroup?.isolate?.compaction === true && compactionGroup?.isolate?.toolResultPruner === true,
-    'dev-plan compaction isolate 两个键都为 true',
-  )
-  check(
-    ['@deepseek-ai/dsh-compaction-basic', '@deepseek-ai/dsh-command-compact', '@deepseek-ai/dsh-compaction-tool-result-pruner'].every(
-      (name) => compactionChildren.includes(name),
-    ),
-    'dev-plan compaction 组含三行',
-    compactionChildren.join(', '),
-  )
-
-  // ── dev-plan 工具面（不因角色模板迁移而放宽）────────────────────────────────
-  const devPlanRows = flatten(devPlan?.plugins)
-  const devPlanNames = pluginNames(devPlanRows)
-  const FORBIDDEN_IN_DEV_PLAN = [
-    '@deepseek-ai/dsh-tool-fs',
-    '@deepseek-ai/dsh-tool-fs-search',
-    '@deepseek-ai/dsh-tool-web',
-    '@deepseek-ai/dsh-tool-bash',
-    '@deepseek-ai/dsh-tool-pwsh',
-    '@deepseek-ai/dsh-tool-workflow',
-    '@deepseek-ai/dsh-tool-jobs',
-    '@deepseek-ai/dsh-tool-schedule',
-    '@deepseek-ai/dsh-tool-goal',
-    '@deepseek-ai/dsh-tool-skill',
-    '@deepseek-ai/dsh-tool-todo',
-    '@deepseek-ai/dsh-tool-present',
-    '@deepseek-ai/dsh-tool-subagent-fork',
-    '@deepseek-ai/dsh-skill-filesystem',
-    '@deepseek-ai/dsh-plan-mode',
-  ]
-  for (const name of FORBIDDEN_IN_DEV_PLAN) {
-    check(!devPlanNames.includes(name), `dev-plan 不挂载 ${name}`)
+  for (const forbidden of surface.modules.preset.FORBIDDEN_MAIN_PLUGINS) {
+    check(!standardRows.some((row) => row?.name === forbidden), `主窗不挂载 ${forbidden}`)
   }
   for (const required of [
     '@deepseek-ai/dsh-persona',
@@ -630,612 +420,1231 @@ export function checksFor(data) {
     '@deepseek-ai/dsh-tool-ask-user',
     '@deepseek-ai/dsh-tool-subagent-control',
   ]) {
-    check(devPlanNames.includes(required), `dev-plan 挂载 ${required}`)
+    check(standardRows.some((row) => row?.name === required), `主窗挂载 ${required}`)
   }
 
-  const subagentRows = byName(devPlanRows, '@deepseek-ai/dsh-tool-subagent')
-  check(subagentRows.length === 3, 'dev-plan 恰好 3 个 tool-subagent 实例', String(subagentRows.length))
-  const toolNames = subagentRows.map((row) => row?.config?.toolName)
-  check(new Set(toolNames).size === toolNames.length, 'toolName 互不重复', toolNames.join(', '))
+  const toolRows = flattenPlugins(standard?.plugins).filter((row) => row?.name === '@deepseek-ai/dsh-tool-subagent')
+  check(toolRows.length === 4, '主窗恰好 4 个委派工具', String(toolRows.length))
+  const toolNames = toolRows.map((row) => row?.config?.toolName)
+  check(JSON.stringify([...toolNames].sort()) === JSON.stringify(['develop', 'recon', 'review', 'scribe']), '四个委派工具是 recon/review/scribe/develop', toolNames.join(', '))
+  check(new Set(toolNames).size === toolNames.length, 'toolName 互不重复')
   check(
-    JSON.stringify([...toolNames].sort()) === JSON.stringify(['recon', 'review', 'scribe']),
-    'toolName 恰为 recon/review/scribe',
-    toolNames.join(', '),
+    toolRows.find((row) => row?.config?.toolName === 'develop')?.config?.agentPreset === 'standard',
+    'develop 默认使用 standard',
   )
-
-  for (const row of subagentRows) {
+  for (const name of ['recon', 'review', 'scribe']) {
+    check(
+      toolRows.find((row) => row?.config?.toolName === name)?.config?.agentPreset === 'standard',
+      `${name} 继续使用 standard`,
+    )
+  }
+  for (const row of toolRows) {
     const cfg = row.config ?? {}
     const name = cfg.toolName
-    check(cfg.provider === 'spawn', `${name} provider=spawn（只有进程内 spawn 支持 agentPreset）`)
-    check(cfg.agentPreset === 'standard', `${name} agentPreset=standard`, String(cfg.agentPreset))
+    check(cfg.provider === 'spawn', `${name} provider=spawn`)
     check(cfg.maxDepth === 1, `${name} maxDepth=1`, String(cfg.maxDepth))
     check(cfg.modelSelection === false, `${name} 关闭 modelSelection`)
     check(cfg.modelDiscovery === false, `${name} 关闭 modelDiscovery`)
-    check(cfg.allowedAgentPresets === undefined, `${name} 不设 allowedAgentPresets（角色靠工具名路由）`)
+    check(cfg.allowedAgentPresets === undefined, `${name} 不设 allowedAgentPresets`)
     check(
-      cfg.agentOptions?.provider === EXPECTED_ROUTE.provider,
-      `${name} agentOptions.provider 精确为 ${EXPECTED_ROUTE.provider}`,
-      String(cfg.agentOptions?.provider),
-    )
-    check(
-      cfg.agentOptions?.model === EXPECTED_ROUTE.model,
-      `${name} agentOptions.model 精确为 ${EXPECTED_ROUTE.model}`,
-      String(cfg.agentOptions?.model),
-    )
-    check(
-      JSON.stringify(cfg.agentOptions) === JSON.stringify(EXPECTED_ROUTE),
-      `${name} agentOptions 只含 provider/model 两个键`,
+      JSON.stringify(cfg.agentOptions) === JSON.stringify({ provider: 'dsh-opencode-go', model: 'deepseek-v4.1-flash' }),
+      `${name} agentOptions 与默认设置一致`,
       JSON.stringify(cfg.agentOptions),
     )
   }
-  check(!presets.has('standard'), 'agentPreset=standard 指向宿主内置 preset，不由本包注册')
+  const defaultRoute = JSON.stringify({ provider: 'dsh-opencode-go', model: 'deepseek-v4.1-flash' })
+  check(
+    toolRows.every((row) => JSON.stringify(row.config.agentOptions) === defaultRoute),
+    '四个工具共用同一路由（同一设置真源）',
+  )
 
-  // ── 已删除 preset 的注册路径全部清理 ──────────────────────────────────────
-  const indexSource = files['index.js'] ?? ''
-  check(!/scout|scribe/i.test(indexSource), 'index.js 不再引用 scout/scribe（注册路径已清理）')
-  check(!/from\s+['"]@deepseek-ai\//.test(indexSource), 'index.js 不 import @deepseek-ai/*（链接安装解析不到宿主包）')
-  check(!/ctx\.tools\.register/.test(indexSource), 'index.js 不注册模型可见工具')
-  check(!/webServer/.test(indexSource), 'index.js 不注册 HTTP 路由')
-
-  // ── locale / 文档 ─────────────────────────────────────────────────────────
-  for (const rel of ['locale/zh.json', 'locale/en.json']) {
-    let locale = null
-    try {
-      locale = JSON.parse(files[rel] ?? '')
-    } catch (error) {
-      check(false, `${rel} 是合法 JSON`, error instanceof Error ? error.message : String(error))
-      continue
-    }
-    check(typeof locale?.meta?.title === 'string' && locale.meta.title.length > 0, `${rel} 有 meta.title`)
+  // ── 动态 preset：deep-ptc / 回退 / reasoningEffort ────────────────────────
+  check(
+    findTool(deepPtc, 'develop')?.config?.agentPreset === 'deep-ptc',
+    'deep-ptc 模式只把 develop 切到 deep-ptc',
+  )
+  for (const name of ['recon', 'review', 'scribe']) {
     check(
-      typeof locale?.meta?.description === 'string' && locale.meta.description.length > 0,
-      `${rel} 有 meta.description`,
+      findTool(deepPtc, name)?.config?.agentPreset === 'standard',
+      `deep-ptc 模式下 ${name} 仍是 standard`,
     )
-    check(locale?.meta?.detail === 'detail.md', `${rel} 的 meta.detail 指向 detail.md`)
   }
-  const zhDescription = (() => {
-    try {
-      return JSON.parse(files['locale/zh.json'] ?? '{}')?.meta?.description ?? ''
-    } catch {
-      return ''
-    }
-  })()
-  const enDescription = (() => {
-    try {
-      return JSON.parse(files['locale/en.json'] ?? '{}')?.meta?.description ?? ''
-    } catch {
-      return ''
-    }
-  })()
-  check(!/只读的\s*scout/.test(String(zhDescription)), 'locale/zh 不把 scout 说成独立只读 preset', String(zhDescription).slice(0, 40))
-  check(/模板/.test(String(zhDescription)), 'locale/zh 描述说明角色靠模板携带')
-  check(/template/i.test(String(enDescription)), 'locale/en 描述说明角色靠 template 携带')
+  check(/deep-ptc/.test(deepPtc?.description ?? ''), 'deep-ptc description 写明模式')
+  check(/已回退 standard/.test(fallback?.description ?? ''), '回退 description 写明「已回退 standard」')
   check(
-    /完整工具面/.test(String(zhDescription)) &&
-      /任务级提示词约束/.test(String(zhDescription)) &&
-      /不是工具\/权限隔离/.test(String(zhDescription)),
-    'locale/zh 说明 standard 保留完整工具面、模板只是任务级提示词约束',
-    String(zhDescription).slice(0, 60),
+    /没有可用的施工方式|未安装|未启用|已被移除/.test(fallback?.description ?? ''),
+    '回退原因涵盖目录缺失而非误断为未安装',
+    fallback?.description ?? '',
   )
   check(
-    /full tool surface/i.test(String(enDescription)) &&
-      /task-level prompt constraints/i.test(String(enDescription)) &&
-      /not tool or permission isolation/i.test(String(enDescription)),
-    'locale/en 说明 standard 保留完整工具面、模板只是任务级提示词约束',
-    String(enDescription).slice(0, 80),
+    findTool(custom, 'develop')?.config?.agentPreset === 'team-builder',
+    '任意有效 preset 可作 develop',
+  )
+  check(/团队施工/.test(custom?.description ?? ''), '自定义 preset 名称进入 description')
+  check(
+    surface.selfFallback.fallback === true && /递归派工/.test(surface.selfFallback.reason ?? ''),
+    'dev-plan 自身被拒绝，避免递归',
+  )
+  check(
+    surface.modules.settings.DEFAULT_SETTINGS.guardAllSubagents === false,
+    '默认 guardAllSubagents=false（只守 dev-plan 子代理）',
+  )
+  check(/已回退 standard/.test(findPresetPlugin(fallback, 'persona')?.config?.prefix ?? ''), '回退 persona 写明「已回退 standard」')
+  check(/不是静默降级/.test(findPresetPlugin(fallback, 'persona')?.config?.prefix ?? ''), '回退说明不是静默降级')
+  check(
+    JSON.stringify(findTool(withEffort, 'develop')?.config?.agentOptions) ===
+      JSON.stringify({ provider: 'dsh-opencode-go', model: 'deepseek-v4.1-flash', reasoningEffort: 'high' }),
+    'childReasoningEffort 非空时进入 agentOptions',
+    JSON.stringify(findTool(withEffort, 'develop')?.config?.agentOptions),
+  )
+  check(
+    !Object.hasOwn(findTool(standard, 'develop')?.config?.agentOptions ?? {}, 'reasoningEffort'),
+    'childReasoningEffort 为空时省略该键',
   )
 
-  const readme = files['README.md'] ?? ''
-  for (const marker of [
-    '方案 A',
-    '方案 B',
-    '取舍',
-    '只注册',
-    'dev-plan',
-    '角色模板',
-    'standard',
-    '提示词',
-    '声明级',
-    '任务级',
-    '实际可见工具面',
-    'config_',
-    'working_directory',
-    'dsh-opencode-go',
-    'deepseek-v4.1-flash',
-    'askLimit',
-    '软约束',
-    'AGENTS.md',
-    '技能目录',
-    '高层指令',
+  // ── compaction / persona ─────────────────────────────────────────────────
+  const compaction = flattenPlugins(standard?.plugins).find((row) => row?.id === 'compaction')
+  check(compaction?.group === true, 'compaction 是 group')
+  check(compaction?.isolate?.compaction === true && compaction?.isolate?.toolResultPruner === true, 'compaction isolate 两个键都为 true')
+  check(
+    ['@deepseek-ai/dsh-compaction-basic', '@deepseek-ai/dsh-command-compact', '@deepseek-ai/dsh-compaction-tool-result-pruner'].every(
+      (name) => flattenPlugins(compaction?.config).some((row) => row?.name === name),
+    ),
+    'compaction 组含三行',
+  )
+
+  const personaRow = findPresetPlugin(standard, 'persona')
+  const persona = `${personaRow?.config?.prefix ?? ''}${personaRow?.config?.suffix ?? ''}`
+  check(typeof personaRow?.config?.prefix === 'string' && personaRow.config.prefix.length > 1000, 'persona.prefix 是实质内容（>1000 字符）', `${personaRow?.config?.prefix?.length ?? 0} chars`)
+  check(typeof personaRow?.config?.suffix === 'string' && personaRow.config.suffix.length > 100, 'persona.suffix 非空（不遮蔽部署级 suffix）')
+  check(!/\{\{/.test(persona), 'persona 不含模板变量')
+  check(!/不是[\u201c"]被要求不要用/.test(persona), 'persona 没有错误的硬保证')
+
+  for (const [marker, label] of [
+    ['你自身永不亲自写代码', 'persona 说明主窗永不亲自写代码'],    ['默认只规划与复核', 'persona 说明默认只规划/复核'],
+    ['只有用户明确说“开工', 'persona 只在用户明确开工时派 develop'],
+    ['name=developer', 'persona 固定 developer'],
+    ['send_message', 'persona 用 send_message 续派'],
+    ['不反复新建子代理', 'persona 不反复新建子代理'],
+    ['独立 review', 'persona 施工后可派独立 review'],
+    ['返工给同一 developer', 'persona 返工给同一 developer'],
+    ['不依赖双窗按钮', 'persona 返工不依赖双窗按钮'],
+    ['扩大范围、越权改动、不可逆风险', 'persona 只在扩大范围/越权/不可逆风险时问用户'],
+    ['不要再次请求同一个开工批准', 'persona 不重复请求开工批准'],
+    ['不向人类提问', 'develop 不向人类提问'],
+    ['不能把子代理的自述当作自己已经运行测试', 'persona 禁止把子代理自述当成自己运行测试'],
+    ['同一任务不得同时使用 develop 和 rework_task/ask_worker', '双通道互斥'],
+    ['目标：', '任务书含目标'],
+    ['非目标：', '任务书含非目标'],
+    ['验收标准：', '任务书含验收标准'],
+    ['允许改动路径：', '任务书含允许改动路径'],
+    ['完成定义：', '任务书含完成定义'],
+    ['汇报格式：', '任务书含汇报格式'],
+    ['1. 改动：', '汇报格式含改动'],
+    ['2. 真实命令与输出：', '汇报格式含真实命令与输出'],
+    ['3. 自验收：', '汇报格式含自验收'],
+    ['4. 风险：', '汇报格式含风险'],
+    ['5. 假设与未验证项：', '汇报格式含假设与未验证项'],
+    // P0 流程提效
+    ['快速路径', 'P0 风险路由含快速路径'],
+    ['标准路径', 'P0 风险路由含标准路径'],
+    ['高风险路径', 'P0 风险路由含高风险路径'],
+    ['歧义', 'P0 判定维度含歧义'],
+    ['影响面', 'P0 判定维度含影响面'],
+    ['可逆性', 'P0 判定维度含可逆性'],
+    ['可验证性', 'P0 判定维度含可验证性'],
+    ['提高风险等级', 'P0 证据不足时提高风险等级'],
+    ['绝不因验证困难降低路径等级', 'P0 绝不因验证困难降低路径等级'],
+    ['实际变更证据', 'P0 完工必须附实际变更证据'],
+    ['不能只给文件清单', 'P0 不能只给文件清单'],
+    ['不得声称审过实际 diff', 'P0 摘要不得冒充 diff 审查'],
+    ['补证据', 'P0 缺证据要同一 developer 补证据'],
+    ['一次性开工契约', 'P0 一次性开工契约'],
+    ['接口/依赖', '任务书含接口/依赖'],
+    ['检查命令', '任务书含检查命令'],
+    ['风险/回退', '任务书含风险/回退'],
+    ['普通文件编辑和实现细节不反复等待批准', 'P0 普通实现不反复等待批准'],
+    ['只有范围扩大、风险变化或宿主权限要求', 'P0 仅范围/风险/权限变化重确认'],
+    ['最小切片', 'P0 验收前置含最小切片'],
+    ['语法/静态契约', 'P0 验收排序含语法/静态契约'],
+    ['针对性测试', 'P0 验收排序含针对性测试'],
+    ['必要运行/GUI 验收', 'P0 验收排序含必要运行/GUI'],
+    ['静态检查不等于真实验证', 'P0 禁止静态检查冒充真实验证'],
+    ['非阻塞协作', 'P0 非阻塞协作'],
+    ['不轮询', 'P0 主窗不轮询'],
+    ['不忙等', 'P0 主窗不忙等'],
+    ['不重复施工', 'P0 主窗不重复施工'],
+    ['不重复读取', 'P0 主窗不重复读取 developer 文件'],
+    ['developer 只在阻塞、范围冲突或关键契约需要决策时打断主窗', 'P0 developer 打断边界'],
+    ['verified / partial / failed', 'P0 汇报含验证状态分级'],
+    ['实际 diff 和关键证据', 'P0 主窗审实际 diff/关键证据'],
+    ['阻塞问题', 'P0 阻塞问题返工'],
+    ['非阻塞建议', 'P0 非阻塞建议不无限打磨'],
+    ['主窗最终审查责任不外包', 'P0 最终审查责任不外包'],
+    ['recon：只在缺少事实', 'P0 recon 仅缺事实'],
+    ['review：只在高风险', 'P0 review 仅高风险/需要'],
+    ['scribe：只在文档属于验收范围', 'P0 scribe 仅验收/用户需要'],
+    ['文本不是派工', 'P0 文本不是派工'],
+    ['必须实际调用 develop', 'P0 授权后必须实际调用 develop'],
+    ['只有工具接受后才可说“已派出 developer”', 'P0 工具接受后才可称已派出'],
+    ['未派工', 'P0 未派工如实报告'],
+    ['任务书是 develop 的 prompt 参数', 'P0 任务书是工具参数不是聊天交付'],
+    ['不得停在计划、前言或任务书文本', 'P0 授权后不得停在任务书文本'],
+    ['实际调用 send_message', 'P0 返工必须实际 send_message'],
+    // 施工目录/权限防护
+    ['施工目录与权限', 'persona 写明施工目录与权限'],
+    ['工具创建参数', 'persona 要求用创建参数指定真实施工目录'],
+    ['cwd', 'persona 明确 cwd 参数'],
+    ['可写工作区', 'persona 派工前检查可写工作区'],
+    ['不得先以其他目录 spawn', 'persona 禁止先建后 cd'],
+    ['不假设已有子代理权限会随之扩大', 'persona 不假设权限会扩大'],
+    ['沙箱模式', 'persona 权限失败记录沙箱模式'],
+    ['真实错误原文', 'persona 权限失败记录真实错误'],
   ]) {
-    check(readme.includes(marker), `README 含关键说明：${marker}`)
+    check(persona.includes(marker), label, marker)
   }
   check(
-    /只注册\s*1?\s*个\s*preset/.test(readme) || /只注册\s*`?dev-plan`?/.test(readme),
-    'README 明确当前只注册 dev-plan',
+    !persona.includes('降低路径等级并补验收'),
+    'P0 没有“证据不足就降低路径等级”的回退指令',
   )
   check(
-    /不再是独立 preset 的声明级/.test(readme) ||
-      (/不再是独立 preset/.test(readme) && /声明级/.test(readme) && /提示词约束/.test(readme)),
-    'README 说明 scout/scribe 不再是独立 preset 的声明级隔离',
+    !/只有改动摘要也算证据|只给文件清单(?:也)?可以/.test(persona),
+    'P0 没有“摘要/文件清单就是证据”的错误说法',
   )
   check(
-    /上次安装操作记录/.test(readme) && /0\.1\.0\s*\/\s*applied/.test(readme),
-    'README 区分上次安装操作记录为 0.1.0/applied',
+    !/文本也能算派工|没有调用也可以说已派出|文本任务书即视为已派工/.test(persona),
+    'P0 没有“文本任务书即视为已派工”的错误说法',
   )
-  check(
-    /live listing/.test(readme) && /0\.2\.0/.test(readme) && /enabled\/installed=true/.test(readme),
-    'README 记录管理器 live listing 已读为 0.2.0/enabled/installed',
-  )
-  check(
-    /list_bundles/.test(readme) && /(不是|不能当|不能当作?)[^\n]{0,12}重装配证据/.test(readme),
-    'README 说明 list_bundles 不是重装配证据',
-  )
-  check(
-    /no-op/.test(readme) &&
-      (/确认[^\n]{0,20}(apply|重装配)|(apply|重装配)[^\n]{0,20}确认/.test(readme)),
-    'README 说明同 link 重装 no-op 需确认实际 apply',
-  )
-  check(
-    !/(插件管理器|管理器)(仍然|仍|还是)[^\n]{0,12}(旧|0\.1\.0)/.test(readme) &&
-      !/运行中的装配(仍然|仍|还是)[^\n]{0,12}旧/.test(readme),
-    'README 不再声称插件管理器或运行装配停留在旧 0.1.0',
-  )
-  const README_STALE = [
-    /内部角色\s*·\s*只读侦察/,
-    /内部角色\s*·\s*文档记录/,
-    /preset-scout/,
-    /preset-scribe/,
-    /注册(了)?\s*(三个|3\s*个)\s*preset/,
-    /三个 preset，一条分工线/,
-    /插件管理器仍是旧/,
-    /运行中的装配仍是旧/,
-    /管理器没有重新 apply、没有重启/,
-  ]
-  const readmeStale = README_STALE.filter((re) => re.test(readme)).map(String)
-  check(readmeStale.length === 0, 'README 不把 scout/scribe 描述为已注册 preset', readmeStale.join(', ') || '无')
-  check(!/不是[\u201c"]被要求不要用[\u201d"]/.test(readme), 'README 没有“不是被要求不要用”这类错误硬保证')
 
-  const detailDoc = files['detail.md'] ?? ''
-  check(detailDoc.length > 500, 'detail.md 是实质文档', `${detailDoc.length} chars`)
-  for (const marker of ['方案 B', '只注册', '角色模板', 'standard', '任务级', '不是硬安全隔离']) {
-    check(detailDoc.includes(marker), `detail.md 含关键说明：${marker}`)
+  // 角色模板仍然保留
+  const scoutTemplate = extractTemplate(personaRow?.config?.prefix ?? '', 'SCOUT')
+  const scribeTemplate = extractTemplate(personaRow?.config?.prefix ?? '', 'SCRIBE')
+  check(typeof scoutTemplate === 'string' && scoutTemplate.length > 300, '侦察/复核角色模板存在', `${scoutTemplate?.length ?? 0} chars`)
+  check(typeof scribeTemplate === 'string' && scribeTemplate.length > 200, '文书角色模板存在', `${scribeTemplate?.length ?? 0} chars`)
+  const scoutAllowMatch = /允许使用的工具只有[：:]\s*([^。\n]+)。\s*除此之外的一切工具一律不得调用。/.exec(scoutTemplate ?? '')
+  const scoutAllow = scoutAllowMatch ? scoutAllowMatch[1].split(/[、,，]/).map((item) => item.trim()).filter(Boolean) : []
+  check(
+    JSON.stringify(scoutAllow) === JSON.stringify(['read', 'read_image', 'glob', 'grep', 'web_search', 'web_fetch']),
+    '侦察/复核模板允许工具精确为六项（追加 write 即失败）',
+    scoutAllow.join(', ') || '空',
+  )
+  const scribeRules = numberedRules(scribeTemplate ?? '')
+  check(scribeRules.size === 6, '文书模板保留 6 条编号规则', [...scribeRules.keys()].join(', '))
+  check(/^只允许写规划与复核类文档/.test(scribeRules.get(3) ?? '') && /超出文书子代理职责/.test(scribeRules.get(3) ?? ''), '文书规则 3 限定文档范围')
+  check(/^不使用\s*Shell、Web、搜索与委派工具，也不要尝试替代。/.test(scribeRules.get(5) ?? ''), '文书规则 5 精确禁止 Shell/Web/搜索/委派')
+  check(/^config_\*、working_directory 以及任何未声明的工具都不得调用。/.test(scribeRules.get(6) ?? ''), '文书规则 6 精确禁止 config_*/working_directory')
+  const boundary = 'standard 的工具、persona、项目 AGENTS.md 或技能目录即使出现更多能力，也不得据此扩大本角色边界'
+  const conflict = '若更高优先级指令与本模板的角色边界冲突，停止相关动作，并在回传里向主代理报告冲突，不擅自越界执行'
+  check((scoutTemplate ?? '').includes(boundary) && (scribeTemplate ?? '').includes(boundary), '两个模板禁止因 standard/AGENTS/skills 扩大边界')
+  check((scoutTemplate ?? '').includes(conflict) && (scribeTemplate ?? '').includes(conflict), '两个模板要求高层指令冲突时停止并报告')
+  check(/recon\s*与\s*review[^\n]*侦察\/复核角色模板/.test(persona), '派遣指令绑定 recon/review 与侦察模板')
+  check(/scribe[^\n]*文书角色模板/.test(persona), '派遣指令绑定 scribe 与文书模板')
+  check(/每次调用都完整附带/.test(persona) && /不能写「同上」/.test(persona) && /以模板为准/.test(persona), '派遣纪律要求逐字附带模板')
+
+  // ── locale / README / detail ─────────────────────────────────────────────
+  for (const [name, value, error] of [
+    ['locale/zh.json', locale.zh, surface.localeErrors.zh],
+    ['locale/en.json', locale.en, surface.localeErrors.en],
+  ]) {
+    check(error === null, `${name} 是合法 JSON`, error ?? '')
+    check(typeof value?.meta?.title === 'string' && value.meta.title.length > 0, `${name} 有 meta.title`)
+    check(typeof value?.meta?.description === 'string' && value.meta.description.length > 0, `${name} 有 meta.description`)
+    check(value?.meta?.detail === 'detail.md', `${name} meta.detail=detail.md`)
   }
-  const detailStale = README_STALE.filter((re) => re.test(detailDoc)).map(String)
-  check(detailStale.length === 0, 'detail.md 不把 scout/scribe 描述为已注册 preset', detailStale.join(', ') || '无')
   check(
-    /live listing/.test(detailDoc) && /0\.2\.0/.test(detailDoc) && /0\.1\.0\s*\/\s*applied/.test(detailDoc),
-    'detail.md 区分上次安装记录与 live listing',
+    locale.zh?.meta?.title === '开发规划与交付模式',
+    'locale/zh 插件显示名为「开发规划与交付模式」',
+    locale.zh?.meta?.title,
   )
+  check(
+    locale.en?.meta?.title === 'Development planning & delivery Mode',
+    'locale/en 插件显示名为 Development planning & delivery Mode',
+    locale.en?.meta?.title,
+  )
+  for (const marker of ['develop', 'standard', 'deep-ptc', '模型守门']) {
+    check(String(locale.zh?.meta?.description ?? '').includes(marker), `locale/zh 说明 ${marker}`)
+  }
+  for (const marker of ['develop', 'standard', 'deep-ptc', 'model guard']) {
+    check(String(locale.en?.meta?.description ?? '').toLowerCase().includes(marker.toLowerCase()), `locale/en 说明 ${marker}`)
+  }
 
-  check(/node_modules/.test(files['.gitignore'] ?? ''), '.gitignore 忽略 node_modules')
+  for (const marker of [
+    '0.3.0',
+    'develop',
+    'standard',
+    'deep-ptc',
+    'ctx.agentPresets.register',
+    'cordis.patch.yml 只挂根插件',
+    '模型守门',
+    '只管理子代理',
+    '绝不钉主会话',
+    'dsh-subagent-model-pin',
+    '先验证本插件，再禁用旧插件',
+    '现有会话',
+    '新建会话',
+    '回退',
+    '已回退 standard',
+    '未验证',
+    'node scripts/verify-presets.mjs',
+    'node --test',
+  ]) {
+    check(String(readme ?? '').includes(marker), `README 含关键说明：${marker}`)
+  }
+  check(/settings|插件页/.test(String(readme ?? '')), 'README 说明设置入口')
+  check(/js-yaml/.test(String(readme ?? '')), 'README 说明不依赖 js-yaml')
+  for (const marker of [
+    'docs/flow-redesign.md',
+    '快速路径',
+    '标准路径',
+    '高风险路径',
+    '一次性开工契约',
+    '验收前置',
+    '非阻塞协作',
+    'verified/partial/failed',
+    '实际变更证据',
+    '不能只给文件清单',
+    '接口/依赖',
+    '检查命令',
+    '风险/回退',
+    'P1',
+    'P2',
+    '不新增设置项',
+  ]) {
+    check(String(readme ?? '').includes(marker), `README 含 P0 说明：${marker}`)
+  }
+  check(/接口\/依赖[：:]/.test(String(readme ?? '')), 'README 任务书模板含接口/依赖字段')
+  check(/风险\/回退[：:]/.test(String(readme ?? '')), 'README 任务书模板含风险/回退字段')
+  check(String(readme ?? '').includes('显示名已定'), 'README 写明显式显示名已定')
+  check(!String(readme ?? '').includes('显示名未定'), 'README 不再声称显示名未定')
+  check(String(readme ?? '').includes('开发规划与交付'), 'README 使用新显示名')
+  for (const marker of ['已安装 → 开发规划与交付模式', '404', '仍无条件注册设置页', 'config-editor-unavailable', '--dsw-alias-', 'guard 卸载', 'dsh-client-locale', 'getOrigin']) {
+    check(String(readme ?? '').includes(marker), `README 含 UI/降级/安全说明：${marker}`)
+  }
+
+  for (const marker of [
+    '0.3.0',
+    'develop',
+    'standard',
+    'deep-ptc',
+    '模型守门',
+    '已回退 standard',
+    '未验证',
+    'ctx.agentPresets.register',
+  ]) {
+    check(String(detail ?? '').includes(marker), `detail.md 含关键说明：${marker}`)
+  }
+  for (const marker of [
+    'docs/flow-redesign.md',
+    '快速路径',
+    '非阻塞协作',
+    'P0',
+    '实际变更证据',
+    '不能只给文件清单',
+    '接口/依赖',
+    '检查命令',
+    '风险/回退',
+  ]) {
+    check(String(detail ?? '').includes(marker), `detail.md 含 P0 说明：${marker}`)
+  }
+  for (const marker of ['已安装 → 开发规划与交付模式', '404', 'application/json', '--dsw-alias-', 'guard']) {
+    check(String(detail ?? '').includes(marker), `detail.md 含设置页行为说明：${marker}`)
+  }
+  check(String(detail ?? '').length > 1000, 'detail.md 是实质文档', `${String(detail ?? '').length} chars`)
+
+  const flowDoc = String(files['docs/flow-redesign.md'] ?? '')
+  check(flowDoc.length > 5000, 'docs/flow-redesign.md 是实质开发文档', `${flowDoc.length} chars`)
+  for (const marker of [
+    '背景与目标',
+    'P0 范围与非目标',
+    '风险路由矩阵',
+    '一次性开工契约',
+    'developer 执行与证据报告合同',
+    '主窗非阻塞、审查与返工规则',
+    '配置与工具影响',
+    '可测试的行为断言',
+    '真实验证矩阵',
+    '与调研报告 P0 的逐项追踪',
+    'P0-1',
+    'P0-2',
+    'P0-3',
+    'P0-4',
+    'P0-5',
+    '不做',
+    'P1',
+    'P2',
+    'verified / partial / failed',
+    '主窗最终审查责任不外包',
+    '绝不因验证困难降低路径等级',
+    '实际变更证据',
+    '不能只给文件清单',
+    '不得声称审过实际 diff',
+  ]) {
+    check(flowDoc.includes(marker), `docs/flow-redesign.md 含关键说明：${marker}`)
+  }
 
   return results
 }
 
-// ── 变异层：故意改坏，断言检查会失败 ──────────────────────────────────────────
-const clone = (value) => JSON.parse(JSON.stringify(value))
+/** 真实模块行为检查：用假 ctx 驱动，而不是只读源码。 */
+async function behaviorChecks() {
+  const results = []
+  const check = (ok, label, detail = '') => results.push({ ok: Boolean(ok), label, detail: String(detail) })
+  const registry = createFakeRegistry()
+  const webServer = createFakeWebServer()
+  const configEditor = createFakeConfigEditor()
+  const ctx = createFakeContext({ registry, webServer, configEditor })
+  const modules = await loadModules(ROOT)
+  const { index } = modules
+  try {
+    index.apply(ctx.ctx, { ...modules.settings.DEFAULT_SETTINGS }, { verificationDelayMs: 0 })
+    await ctx.flush()
+    check(registry.definitions.length === 1, 'apply 动态注册 1 个 preset', String(registry.definitions.length))
+    check(registry.definitions[0]?.id === 'dev-plan', '动态注册 id=dev-plan')
+    check(typeof webServer.handlers.get === 'function', 'webServer 路由注册接口存在')
+    const stateHandler = webServer.handlers.get('/plugins/dev-plan-presets/state')
+    check(typeof stateHandler === 'function', '注册 /plugins/dev-plan-presets/state')
+    const state = await callRoute(stateHandler, 'GET')
+    check(state.code === 200, 'state 路由 GET 200', String(state.code))
+    check(state.body?.effectiveMode === 'standard', 'state 默认 effectiveMode=standard', String(state.body?.effectiveMode))
+    check(state.body?.fallback?.active === false, 'state 默认无回退')
 
-const REMOVE_TEMPLATE = (text, name) =>
-  String(text).replace(
-    new RegExp(
-      `^[ \\t]*=+ ROLE-TEMPLATE:${name}:BEGIN =+[ \\t]*\\r?\\n[\\s\\S]*?^[ \\t]*=+ ROLE-TEMPLATE:${name}:END =+[ \\t]*$\\r?\\n?`,
-      'm',
-    ),
-    '',
-  )
+    const configHandler = webServer.handlers.get('/plugins/dev-plan-presets/config')
+    check(typeof configHandler === 'function', '注册 /plugins/dev-plan-presets/config')
+    const invalid = await callRoute(configHandler, 'POST', { modelGuardMode: 'nonsense' })
+    check(invalid.code === 400, 'config 路由拒绝非法枚举（400）', String(invalid.code))
+    const valid = await callRoute(configHandler, 'POST', {
+      developMode: 'deep-ptc',
+      childProvider: 'p',
+      childModel: 'm',
+      modelGuardMode: 'audit',
+    })
+    check(valid.code === 200, 'config 路由接受合法配置（200）', String(valid.code))
+    check(configEditor.edits.length === 1, 'config 路由通过 configEditor.edit 写回', String(configEditor.edits.length))
+    check(configEditor.edits[0]?.next?.developMode === 'deep-ptc', '写回值包含 developMode=deep-ptc')
 
-const MUTATIONS = [
+    const textPlain = await callRoute(configHandler, 'POST', { modelGuardMode: 'audit' }, { 'content-type': 'text/plain' })
+    check(textPlain.code === 415, 'config 路由拒绝 text/plain（415）', String(textPlain.code))
+    const crossSite = await callRoute(
+      configHandler,
+      'POST',
+      { modelGuardMode: 'audit' },
+      { 'content-type': 'application/json', 'sec-fetch-site': 'cross-site' },
+    )
+    check(crossSite.code === 403, 'config 路由拒绝 cross-site（403）', String(crossSite.code))
+    const badOrigin = await callRoute(
+      configHandler,
+      'POST',
+      { modelGuardMode: 'audit' },
+      { 'content-type': 'application/json', origin: 'https://evil.example', host: '127.0.0.1:1162' },
+    )
+    check(badOrigin.code === 403, 'config 路由拒绝错误 Origin（403）', String(badOrigin.code))
+    check(configEditor.edits.length === 1, '被拒绝的配置写请求不调用 configEditor', String(configEditor.edits.length))
+    const sameOrigin = await callRoute(
+      configHandler,
+      'POST',
+      { modelGuardMode: 'audit' },
+      {
+        'content-type': 'application/json; charset=utf-8',
+        origin: 'http://127.0.0.1:1162',
+        host: '127.0.0.1:1162',
+        'sec-fetch-site': 'same-origin',
+      },
+    )
+    check(sameOrigin.code === 200, 'config 路由允许同源 Origin', String(sameOrigin.code))
+    const noOrigin = await callRoute(configHandler, 'POST', { modelGuardMode: 'audit' }, { 'content-type': 'application/json' })
+    check(noOrigin.code === 200, 'config 路由允许无 Origin 的非浏览器客户端', String(noOrigin.code))
+    check(configEditor.edits.length === 3, '同源与无 Origin 请求各写入一次', String(configEditor.edits.length))
+  } catch (error) {
+    check(false, '行为检查执行失败', String(error?.stack ?? error))
+  } finally {
+    await ctx.dispose()
+    check(registry.released.includes('dev-plan'), 'dispose 时交还动态 preset disposer', registry.released.join(', '))
+    check(webServer.handlers.size === 0, 'dispose 时移除设置页路由', String(webServer.handlers.size))
+    check(!ctx.listeners.get('agent/created')?.length, 'dispose 时移除 agent/created 监听')
+  }
+
+  // deep-ptc：entry 只做诊断，registry 才算可用
   {
-    name: '子代理路由被改成非低成本模型',
-    expect: 'model 精确为',
-    mutate(data) {
-      findSubagentRow(data, 'recon').config.agentOptions.model = 'deepseek-chat'
-    },
-  },
+    const entryRegistry = createFakeRegistry({ rows: [] })
+    const entryWeb = createFakeWebServer()
+    const entryCtx = createFakeContext({
+      registry: entryRegistry,
+      webServer: entryWeb,
+      entries: [{ id: 'deep-ptc-settings', options: { name: 'dsh-deep-ptc-mode' }, fiber: { state: 1 } }],
+    })
+    index.apply(entryCtx.ctx, { ...modules.settings.DEFAULT_SETTINGS, developMode: 'deep-ptc' }, { verificationDelayMs: 0 })
+    await entryCtx.flush()
+    const entryDefinition = entryRegistry.definitions[0]
+    check(
+      entryDefinition?.plugins.find((row) => row.id === 'tool-subagent-develop')?.config?.agentPreset === 'standard',
+      '只有 loader entry（LOADING）时保守回退 standard',
+    )
+    const entryState = await callRoute(entryWeb.handlers.get('/plugins/dev-plan-presets/state'), 'GET')
+    check(entryState.body?.fallback?.active === true, 'entry-only 时 state 显式回退')
+    check(/没有可用的施工方式|未安装|未启用|已被移除/.test(entryState.body?.fallback?.reason ?? ''), '回退原因涵盖目录缺失', entryState.body?.fallback?.reason)
+    await entryCtx.dispose()
+  }
   {
-    name: 'recon 的 provider 被改错',
-    expect: 'provider 精确为',
-    mutate(data) {
-      findSubagentRow(data, 'recon').config.agentOptions.provider = 'other-provider'
-    },
-  },
+    const goodRegistry = createFakeRegistry({ rows: [{ id: 'deep-ptc' }] })
+    const goodCtx = createFakeContext({ registry: goodRegistry })
+    index.apply(goodCtx.ctx, { ...modules.settings.DEFAULT_SETTINGS, developMode: 'deep-ptc' }, { verificationDelayMs: 0 })
+    await goodCtx.flush()
+    const goodDefinition = goodRegistry.definitions[0]
+    check(
+      goodDefinition?.plugins.find((row) => row.id === 'tool-subagent-develop')?.config?.agentPreset === 'deep-ptc',
+      'registry 中存在 deep-ptc 时 develop 使用 deep-ptc',
+    )
+    check(
+      goodDefinition?.plugins.find((row) => row.id === 'tool-subagent-recon')?.config?.agentPreset === 'standard',
+      'deep-ptc 时 recon 仍为 standard',
+    )
+    await goodCtx.dispose()
+  }
+
+  // 守门：pin
   {
-    name: 'agentPreset 被改回 scout（误改 standard / 遗留绑定）',
-    expect: 'agentPreset=standard',
-    mutate(data) {
-      findSubagentRow(data, 'review').config.agentPreset = 'scout'
-    },
-  },
+    const registry2 = createFakeRegistry()
+    const child = createFakeAgent({ id: 'child-x', parentSession: 'main', origin: 'subagent', current: undefined })
+    const parent = createFakeAgent({ id: 'main', agentPreset: 'dev-plan', current: { provider: 'expensive', model: 'big' } })
+    const ctx2 = createFakeContext({ registry: registry2, agents: { get: (id) => (id === 'main' ? parent.agent : child.agent) } })
+    index.apply(ctx2.ctx, { ...modules.settings.DEFAULT_SETTINGS }, { verificationDelayMs: 0 })
+    await ctx2.flush()
+    const listener = ctx2.listeners.get('agent/created')?.[0]
+    check(typeof listener === 'function', 'pin 模式注册 agent/created')
+    listener({ agent: child.agent })
+    check(
+      child.selects.length === 1 && child.selects[0].provider === 'dsh-opencode-go',
+      'pin 模式创建时选择目标路由',
+      JSON.stringify(child.selects),
+    )
+    const decision = await child.stepHandlers[0](
+      { modelSelection: { provider: 'other', model: 'expensive' } },
+      async () => ({ kind: 'enter', messages: [] }),
+    )
+    check(decision?.kind === 'reject', 'pre-step 越界返回 reject', JSON.stringify(decision))
+    check(child.cancelled.length === 1, 'pre-step 越界 cancel 子代理')
+    check(parent.injected.length === 1, 'pre-step 越界通知父会话')
+    listener({ agent: parent.agent })
+    check(parent.selects.length === 0, '主会话永不被 select')
+    check(child.stepHandlers.length === 1, 'pin 创建后 child 有 pre-step 守卫')
+    await ctx2.dispose()
+    check(child.stepHandlers.length === 0, '插件卸载时真正移除 child 的 pre-step 守卫')
+    check(!ctx2.listeners.get('agent/created')?.length, '插件卸载时移除 agent/created 监听')
+    check(!ctx2.listeners.get('agent/disposed')?.length, '插件卸载时移除 agent/disposed 监听')
+  }
+
+  // 守门：select 不可用时仍保留 guard（kill=false 不 cancel，但后续越界要记录）
   {
-    name: 'maxDepth 被放宽到 2',
-    expect: 'maxDepth=1',
-    mutate(data) {
-      findSubagentRow(data, 'scribe').config.maxDepth = 2
-    },
-  },
+    const registry2b = createFakeRegistry()
+    const child = createFakeAgent({ id: 'child-no-select', parentSession: 'main', origin: 'subagent', current: undefined, select: null })
+    const parent = createFakeAgent({ id: 'main', agentPreset: 'dev-plan', current: { provider: 'p', model: 'm' } })
+    const web = createFakeWebServer()
+    const ctx2b = createFakeContext({
+      registry: registry2b,
+      webServer: web,
+      agents: { get: (id) => (id === 'main' ? parent.agent : child.agent) },
+    })
+    index.apply(ctx2b.ctx, { ...modules.settings.DEFAULT_SETTINGS, killOnViolation: false }, { verificationDelayMs: 0 })
+    await ctx2b.flush()
+    ctx2b.listeners.get('agent/created')[0]({ agent: child.agent })
+    check(child.cancelled.length === 0, 'select 缺失 + kill=false 不 cancel 子代理')
+    check(child.stepHandlers.length === 1, 'select 缺失 + kill=false 仍装 pre-step 守卫')
+    const decision = await child.stepHandlers[0](
+      { modelSelection: { provider: 'other', model: 'expensive' } },
+      async () => ({ kind: 'enter', messages: [] }),
+    )
+    check(decision?.kind === 'enter', 'select 缺失 + kill=false 不打断后续 pre-step')
+    const state = await callRoute(web.handlers.get('/plugins/dev-plan-presets/state'), 'GET')
+    check(state.body?.violations?.some((entry) => /越界/.test(entry.text)), 'select 缺失后守卫仍记录越界')
+    await ctx2b.dispose()
+  }
+
+  // 守门：audit / off / honorExplicit
   {
-    name: 'dev-plan persona 被清空',
-    expect: 'persona.prefix 是实质内容',
-    mutate(data) {
-      findPersonaRow(data, 'dev-plan').config.prefix = ''
-    },
-  },
+    const registry3 = createFakeRegistry()
+    const child = createFakeAgent({ id: 'child-a', parentSession: 'main', origin: 'subagent', current: { provider: 'x', model: 'y' } })
+    const parent = createFakeAgent({ id: 'main', agentPreset: 'dev-plan', current: { provider: 'p', model: 'm' } })
+    const ctx3 = createFakeContext({ registry: registry3, agents: { get: (id) => (id === 'main' ? parent.agent : child.agent) } })
+    index.apply(ctx3.ctx, { ...modules.settings.DEFAULT_SETTINGS, modelGuardMode: 'audit' }, { verificationDelayMs: 0 })
+    await ctx3.flush()
+    ctx3.listeners.get('agent/created')[0]({ agent: child.agent })
+    check(child.selects.length === 0, 'audit 模式不 select')
+    const decision = await child.stepHandlers[0](
+      { modelSelection: { provider: 'x', model: 'y' } },
+      async () => ({ kind: 'enter', messages: [] }),
+    )
+    check(decision?.kind === 'enter', 'audit 模式不打断')
+    await ctx3.dispose()
+  }
   {
-    name: '侦察/复核角色模板被整段删除',
-    expect: '侦察/复核角色模板存在且完整',
-    mutate(data) {
-      const persona = findPersonaRow(data, 'dev-plan')
-      persona.config.prefix = REMOVE_TEMPLATE(persona.config.prefix, 'SCOUT')
-    },
-  },
+    const ctx4 = createFakeContext({ registry: createFakeRegistry() })
+    index.apply(ctx4.ctx, { ...modules.settings.DEFAULT_SETTINGS, modelGuardMode: 'off' }, { verificationDelayMs: 0 })
+    await ctx4.flush()
+    check(!ctx4.listeners.get('agent/created'), 'off 模式不注册 agent/created')
+    await ctx4.dispose()
+  }
   {
-    name: '文书角色模板被整段删除',
-    expect: '文书角色模板存在且完整',
-    mutate(data) {
-      const persona = findPersonaRow(data, 'dev-plan')
-      persona.config.prefix = REMOVE_TEMPLATE(persona.config.prefix, 'SCRIBE')
-    },
-  },
+    const registry5 = createFakeRegistry()
+    const child = createFakeAgent({ id: 'child-e', parentSession: 'main', origin: 'subagent', current: { provider: 'explicit', model: 'route' } })
+    const parent = createFakeAgent({ id: 'main', agentPreset: 'dev-plan', current: { provider: 'p', model: 'm' } })
+    const ctx5 = createFakeContext({ registry: registry5, agents: { get: (id) => (id === 'main' ? parent.agent : child.agent) } })
+    index.apply(ctx5.ctx, { ...modules.settings.DEFAULT_SETTINGS, honorExplicit: true }, { verificationDelayMs: 0 })
+    await ctx5.flush()
+    ctx5.listeners.get('agent/created')[0]({ agent: child.agent })
+    check(child.selects.length === 0, 'honorExplicit 尊重显式路由（不 select）')
+    check(child.stepHandlers.length === 0, 'honorExplicit 不为显式路由挂打断守卫')
+    await ctx5.dispose()
+  }
+
+  // 守门范围：默认只守 dev-plan 父会话；global 恢复全局；父 preset 未知时跳过。
   {
-    name: '派遣绑定行被删除（recon/review 不再要求附带模板）',
-    expect: '派遣指令分别绑定 recon/review 与 scribe',
-    mutate(data) {
-      const persona = findPersonaRow(data, 'dev-plan')
-      persona.config.prefix = persona.config.prefix.replace(
-        /^[ \t]*1\. recon 与 review：[^\n]*\r?\n/m,
-        '',
-      )
-    },
-  },
-  {
-    name: '把 fs 工具行加回主代理',
-    expect: 'dev-plan 不挂载 @deepseek-ai/dsh-tool-fs',
-    mutate(data) {
-      const preset = findPresetRow(data, 'dev-plan')
-      preset.config.plugins.push({ id: 'tool-fs', name: '@deepseek-ai/dsh-tool-fs' })
-    },
-  },
-  {
-    name: '重新注册 scout preset（遗留注册路径）',
-    expect: '只注册 1 个 preset',
-    mutate(data) {
-      data.rows.push({
-        name: '@deepseek-ai/dsh-agent-preset',
-        config: { id: 'scout', name: '内部角色 · 只读侦察', order: 90, plugins: [] },
+    const runScope = async (parentPreset, global) => {
+      const registry = createFakeRegistry()
+      const child = createFakeAgent({ id: 'child-scope', parentSession: 'main', origin: 'subagent', current: undefined })
+      const parent = createFakeAgent({
+        id: 'main',
+        agentPreset: parentPreset,
+        current: { provider: 'p', model: 'm' },
       })
-    },
-  },
-  {
-    name: '已删除的 scout 补丁文件被复活',
-    expect: '已删除的补丁文件不存在',
-    mutate(data) {
-      data.files['presets/scout.patch.yml'] = '# resurrected\n'
-    },
-  },
-  {
-    name: 'compaction 的 isolate 被删除',
-    expect: 'compaction isolate 两个键都为 true',
-    mutate(data) {
-      const preset = findPresetRow(data, 'dev-plan')
-      const group = flatten(preset.config.plugins).find((row) => row?.id === 'compaction')
-      delete group.isolate
-    },
-  },
-  {
-    name: '引用一个不存在的 patch',
-    expect: '补丁文件存在',
-    mutate(data) {
-      data.patchList.push('./presets/ghost.patch.yml')
-    },
-  },
-  {
-    name: '桥接例外标记被删除',
-    expect: 'persona 包含必需方法论/禁令标记',
-    mutate(data) {
-      const persona = findPersonaRow(data, 'dev-plan')
-      persona.config.prefix = persona.config.prefix.replaceAll('rework_task', 'removed_tool')
-    },
-  },
-  {
-    name: 'dev-plan suffix 被改成禁止引用任何外部测试结论',
-    expect: 'suffix 允许注明来源地引用执行窗口结论',
-    mutate(data) {
-      const persona = findPersonaRow(data, 'dev-plan')
-      persona.config.suffix = '任何消息都不得宣称执行过测试，也不得引用执行窗口提供的测试结论。\n'
-    },
-  },
-  {
-    name: 'README 恢复声称注册 scout/scribe preset 的陈旧说法',
-    expect: 'README 不把 scout/scribe 描述为已注册 preset',
-    mutate(data) {
-      data.files['README.md'] += '\n| `scout`（内部角色 · 只读侦察） | 被 recon 调用 | read/grep | 写、Shell |\n'
-    },
-  },
-  // ── 语义变异：词还在，但边界被改坏。逐条必须被精确/结构断言抓住。──────────────
-  {
-    name: '侦察模板把“只读侦察”改成“可写侦察”',
-    expect: '侦察/复核模板明确“只读”定位',
-    mutate(data) {
-      const persona = findPersonaRow(data, 'dev-plan')
-      persona.config.prefix = persona.config.prefix.replace(
-        '你是只读侦察与复核子代理',
-        '你是可写侦察与复核子代理',
-      )
-    },
-  },
-  {
-    name: '侦察允许清单追加 write',
-    expect: '侦察/复核模板允许工具集合精确为六项',
-    mutate(data) {
-      const persona = findPersonaRow(data, 'dev-plan')
-      persona.config.prefix = persona.config.prefix.replace(
-        '允许使用的工具只有：read、read_image、glob、grep、web_search、web_fetch。',
-        '允许使用的工具只有：read、read_image、glob、grep、web_search、web_fetch、write。',
-      )
-    },
-  },
-  {
-    name: '删除文书模板“不使用 Shell/Web/搜索/委派”规则',
-    expect: '文书模板规则 5 精确禁止',
-    mutate(data) {
-      const persona = findPersonaRow(data, 'dev-plan')
-      persona.config.prefix = persona.config.prefix.replace(
-        /^[ \t]*5\. 不使用 Shell、Web、搜索与委派工具[^\n]*\r?\n/m,
-        '',
-      )
-    },
-  },
-  {
-    name: '删除文书模板“禁止 config_*/working_directory”规则',
-    expect: '文书模板规则 6 精确禁止',
-    mutate(data) {
-      const persona = findPersonaRow(data, 'dev-plan')
-      persona.config.prefix = persona.config.prefix.replace(
-        /^[ \t]*6\. config_\*、working_directory[^\n]*\r?\n/m,
-        '',
-      )
-    },
-  },
-  {
-    name: '文书模板把“只写规划/复核文档”改成“可写任意文件”',
-    expect: '文书模板规则 3 限定文档写入范围',
-    mutate(data) {
-      const persona = findPersonaRow(data, 'dev-plan')
-      persona.config.prefix = persona.config.prefix.replace(
-        /^[ \t]*3\. 只允许写规划与复核类文档[^\n]*\r?\n/m,
-        '                3. 可以写任意文件，包括产品代码、配置、依赖与脚本。\n',
-      )
-    },
-  },
-]
+      const ctx = createFakeContext({
+        registry,
+        agents: { get: (id) => (id === 'main' ? parent.agent : child.agent) },
+      })
+      index.apply(ctx.ctx, { ...modules.settings.DEFAULT_SETTINGS, guardAllSubagents: global }, { verificationDelayMs: 0 })
+      await ctx.flush()
+      ctx.listeners.get('agent/created')[0]({ agent: child.agent })
+      const guarded = child.stepHandlers.length === 1
+      await ctx.dispose()
+      return guarded
+    }
+    check((await runScope('dev-plan', false)) === true, '默认守 dev-plan 父会话的子代理')
+    check((await runScope('standard', false)) === false, '默认跳过非 dev-plan 父会话')
+    check((await runScope(undefined, false)) === false, '父 preset 未知时跳过守门')
+    check((await runScope('standard', true)) === true, 'guardAllSubagents=true 恢复全局守门')
+  }
 
-function runSyntaxCheck(file) {
+  // fork 形主对话：有 parentSession 但 depth 0、无 origin，不得被守。
+  {
+    const registry = createFakeRegistry()
+    const fork = createFakeAgent({
+      id: 'fork-main',
+      parentSession: 'main',
+      isSeeded: true,
+      delegationDepth: 0,
+      current: undefined,
+    })
+    const parent = createFakeAgent({ id: 'main', agentPreset: 'dev-plan', current: { provider: 'p', model: 'm' } })
+    const ctx = createFakeContext({
+      registry,
+      agents: { get: (id) => (id === 'main' ? parent.agent : fork.agent) },
+    })
+    index.apply(ctx.ctx, { ...modules.settings.DEFAULT_SETTINGS, guardAllSubagents: true }, { verificationDelayMs: 0 })
+    await ctx.flush()
+    ctx.listeners.get('agent/created')[0]({ agent: fork.agent })
+    check(fork.selects.length === 0, 'fork 主对话不被 select（即使 global）')
+    check(fork.stepHandlers.length === 0, 'fork 主对话不挂 pre-step（即使 global）')
+    await ctx.dispose()
+  }
+
+  // 模型目录：真实枚举 + 单 provider 失败局部降级。
+  {
+    const registry = createFakeRegistry()
+    const web = createFakeWebServer()
+    const llm = {
+      listProviders: () => [
+        { id: 'alpha', name: 'Alpha' },
+        { id: 'broken', name: 'Broken' },
+      ],
+      listModels: async (id) => {
+        if (id === 'broken') throw new Error('missing credentials')
+        return [{ id: 'alpha-1', name: 'Alpha One' }]
+      },
+    }
+    const ctx = createFakeContext({ registry, webServer: web, llm })
+    index.apply(ctx.ctx, { ...modules.settings.DEFAULT_SETTINGS }, { verificationDelayMs: 0 })
+    await ctx.flush()
+    const stateHandler = web.handlers.get('/plugins/dev-plan-presets/state')
+    await callRoute(stateHandler, 'GET')
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    await ctx.flush()
+    const state = await callRoute(stateHandler, 'GET')
+    check(state.body?.modelCatalog?.providers?.length === 2, 'state 返回 2 个 provider', String(state.body?.modelCatalog?.providers?.length))
+    check(
+      state.body?.modelCatalog?.providers?.find((item) => item.provider === 'alpha')?.models?.[0]?.model === 'alpha-1',
+      'state 返回 provider 下的 model',
+    )
+    check(
+      state.body?.modelCatalog?.failures?.some((item) => item.provider === 'broken'),
+      '单 provider 失败进入 failures',
+    )
+    await ctx.dispose()
+  }
+
+  return results
+}
+
+function syntaxCheck(file) {
   const result = spawnSync(process.execPath, ['--check', file], { stdio: 'ignore' })
   return { ok: result.status === 0, status: result.status, error: result.error?.message }
 }
 
-/** 跑一个 node 子进程，stdout/stderr 直接写入文件（不用管道，避免受限沙箱的 EPERM）。 */
-function runNodeToFile(args, cwd, env, logFile) {
-  const fd = openSync(logFile, 'w')
-  try {
-    const result = spawnSync(process.execPath, args, { cwd, env, stdio: ['ignore', fd, fd] })
-    return { status: result.status, error: result.error?.message }
-  } finally {
-    closeSync(fd)
-  }
-}
+// ── 变异层 ──────────────────────────────────────────────────────────────────
+const clone = (value) => JSON.parse(JSON.stringify(value))
 
-function copyBundle(dest) {
-  const EXCLUDED_TOP = new Set(['.git', '.verify-tmp', '.verify-copies', '.verify-log.txt'])
-  cpSync(ROOT, dest, {
-    recursive: true,
-    filter: (src) => {
-      const rel = src.slice(ROOT.length).replace(/^[\\/]/, '')
-      if (rel === '') return true
-      return !EXCLUDED_TOP.has(rel.split(/[\\/]/)[0])
+const MUTATIONS = [
+  {
+    name: 'develop 工具被改名（四工具合同破坏）',
+    expect: '四个委派工具是 recon/review/scribe/develop',
+    mutate(surface) {
+      findTool(surface.standard, 'develop').config.toolName = 'subagent'
     },
-  })
-}
-
-function runVerifyEntry(dir) {
-  const logFile = join(dir, '.verify-log.txt')
-  const result = runNodeToFile(
-    [join(dir, 'scripts', 'verify-presets.mjs')],
-    dir,
-    { ...process.env, VERIFY_SKIP_SELFCHECK: '1' },
-    logFile,
-  )
-  let output = ''
-  try {
-    output = readFileSync(logFile, 'utf8')
-  } catch {
-    output = ''
-  }
-  return { status: result.status, output, error: result.error }
-}
-
-const BROKEN_INDEX = 'export function apply(ctx) {\n  const x = {\n\n'
-
-/**
- * 真实文件层自检：在隔离副本里改坏真实文件，用**同一个验证入口**跑，而不是只检查一个生产代码永远不读的临时文件。
- * 第 2 项是元测试：把代码层闸门整体改为恒通过，若坏文件仍被检出，说明第 1 项的结论不是闸门给的。
- */
-function runSelfChecks() {
-  const items = []
-  // 只为元元测试保留一层递归：再深的副本不再跑自检
-  const depth = Number(process.env.VERIFY_SELFCHECK_DEPTH ?? '0')
-  // 副本必须放在包目录之外：cpSync 不允许把目录复制进它自己的子目录
-  const base = join(dirname(ROOT), '.verify-copies')
-  rmSync(base, { recursive: true, force: true })
-  mkdirSync(base, { recursive: true })
-  try {
-    const brokenDir = join(base, 'broken-index')
-    copyBundle(brokenDir)
-    writeFileSync(join(brokenDir, 'index.js'), BROKEN_INDEX, 'utf8')
-    const broken = runVerifyEntry(brokenDir)
-    items.push({
-      name: '隔离副本写坏真实 index.js，同一验证入口检出',
-      ok: broken.status !== 0 && broken.output.includes('node --check index.js：FAIL'),
-      detail: `exit=${broken.status}${broken.error ? `, ${broken.error}` : ''}`,
-    })
-
-    const gateDir = join(base, 'no-code-layer')
-    copyBundle(gateDir)
-    writeFileSync(join(gateDir, 'index.js'), BROKEN_INDEX, 'utf8')
-    const verifyPath = join(gateDir, 'scripts', 'verify-presets.mjs')
-    const gateSource = readFileSync(verifyPath, 'utf8')
-    // 带换行与缩进定位，避免命中本函数里的匹配字符串
-    const syntaxPatched = gateSource.replace(
-      '\n  const syntax = runSyntaxCheck(indexFile)',
-      '\n  const syntax = { ok: true }',
-    )
-    const smokePatched = syntaxPatched.replace(
-      '\n    const mod = await import(moduleUrl)',
-      '\n    const mod = { apply: () => {} }',
-    )
-    const patched = syntaxPatched !== gateSource && smokePatched !== syntaxPatched
-    writeFileSync(verifyPath, smokePatched, 'utf8')
-    const gate = patched ? runVerifyEntry(gateDir) : { status: null, error: '闸门替换未命中' }
-    items.push({
-      name: '删掉代码层闸门后坏 index.js 不再被检出（证明闸门承重）',
-      ok: patched && gate.status === 0,
-      detail: patched ? `exit=${gate.status}` : gate.error,
-    })
-
-    const pkgDir = join(base, 'broken-package-json')
-    copyBundle(pkgDir)
-    writeFileSync(join(pkgDir, 'package.json'), '{ "name": "dsh-dev-plan-presets", "version": ', 'utf8')
-    const pkgRun = runVerifyEntry(pkgDir)
-    const cleanFail = pkgRun.output.includes('FAIL  package.json 是合法 JSON')
-    const hasStack = /\n\s+at\s|SyntaxError/.test(pkgRun.output)
-    items.push({
-      name: '坏 package.json 干净 FAIL（无堆栈）',
-      ok: pkgRun.status !== 0 && cleanFail && !hasStack,
-      detail: `exit=${pkgRun.status}, 命中FAIL=${cleanFail}, 堆栈=${hasStack}`,
-    })
-
-    // 4) 元元测试：在副本里删掉代码层闸门后，让副本自己的自检照常运行 →
-    //    自检第 1 项无法再检出坏 index.js，于是总体验证必须失败（证明自检本身承重）
-    if (depth < 1) {
-      const blindDir = join(base, 'gate-removed-selfcheck')
-      copyBundle(blindDir)
-      const blindVerifyPath = join(blindDir, 'scripts', 'verify-presets.mjs')
-      const blindSource = readFileSync(blindVerifyPath, 'utf8')
-      const blindPatched = blindSource
-        .replace('\n  const syntax = runSyntaxCheck(indexFile)', '\n  const syntax = { ok: true }')
-        .replace('\n    const mod = await import(moduleUrl)', '\n    const mod = { apply: () => {} }')
-      writeFileSync(blindVerifyPath, blindPatched, 'utf8')
-      const blindLog = join(blindDir, '.verify-log.txt')
-      const blind = runNodeToFile(
-        [blindVerifyPath],
-        blindDir,
-        { ...process.env, VERIFY_SELFCHECK_DEPTH: String(depth + 1) },
-        blindLog,
+  },
+  {
+    name: 'develop 默认改成非 standard',
+    expect: 'develop 默认使用 standard',
+    mutate(surface) {
+      findTool(surface.standard, 'develop').config.agentPreset = 'ptc'
+    },
+  },
+  {
+    name: '主窗被加回 fs 工具',
+    expect: '主窗不挂载',
+    mutate(surface) {
+      surface.standard.plugins.push({ id: 'tool-fs', name: '@deepseek-ai/dsh-tool-fs' })
+    },
+  },
+  {
+    name: 'persona 删掉“永不亲自写代码”',
+    expect: 'persona 说明主窗永不亲自写代码',
+    mutate(surface) {
+      const row = findPresetPlugin(surface.standard, 'persona')
+      row.config.prefix = row.config.prefix.replaceAll('你自身永不亲自写代码', '你应当写代码')
+    },
+  },
+  {
+    name: 'persona 删掉固定 developer 名',
+    expect: 'persona 固定 developer',
+    mutate(surface) {
+      const row = findPresetPlugin(surface.standard, 'persona')
+      row.config.prefix = row.config.prefix.replaceAll('name=developer', 'name=worker')
+      row.config.suffix = row.config.suffix.replaceAll('name=developer', 'name=worker')
+    },
+  },
+  {
+    name: 'persona 删掉“不向人类提问”',
+    expect: 'develop 不向人类提问',
+    mutate(surface) {
+      const row = findPresetPlugin(surface.standard, 'persona')
+      row.config.prefix = row.config.prefix.replaceAll('不向人类提问', '可以直接问人类')
+    },
+  },
+  {
+    name: '回退描述被静默（删掉“已回退 standard”）',
+    expect: '回退 description 写明「已回退 standard」',
+    mutate(surface) {
+      surface.fallback.description = surface.fallback.description.replaceAll('已回退 standard', 'standard')
+    },
+  },
+  {
+    name: '四个工具路由不一致',
+    expect: '四个工具共用同一路由',
+    mutate(surface) {
+      findTool(surface.standard, 'recon').config.agentOptions.model = 'deepseek-chat'
+    },
+  },
+  {
+    name: '给 develop 加 allowedAgentPresets',
+    expect: '不设 allowedAgentPresets',
+    mutate(surface) {
+      findTool(surface.standard, 'develop').config.allowedAgentPresets = ['standard', 'deep-ptc']
+    },
+  },
+  {
+    name: '根补丁重新静态注册 preset',
+    expect: '根补丁不再静态注册 dsh-agent-preset',
+    mutate(surface) {
+      surface.patchText += "\n- id: preset-dev-plan\n  name: '@deepseek-ai/dsh-agent-preset'\n"
+    },
+  },
+  {
+    name: 'README 删掉旧模型钉迁移说明',
+    expect: 'README 含关键说明：dsh-subagent-model-pin',
+    mutate(surface) {
+      surface.readme = surface.readme.replaceAll('dsh-subagent-model-pin', 'some-old-plugin')
+    },
+  },
+  {
+    name: 'package.json 增加 deep-ptc 依赖',
+    expect: '不依赖 deep-ptc 包',
+    mutate(surface) {
+      surface.pkg.dependencies = { 'dsh-deep-ptc-mode': '^1.0.0' }
+    },
+  },
+  {
+    name: 'client 注册 key 写错',
+    expect: 'client 注册 key=dsh-dev-plan-presets#dev-plan-presets',
+    mutate(surface) {
+      surface.files['client.js'] = String(surface.files['client.js']).replace(
+        'dsh-dev-plan-presets#dev-plan-presets',
+        'dsh-subagent-model-pin#subagent-model-pin',
       )
-      let blindOut = ''
-      try {
-        blindOut = readFileSync(blindLog, 'utf8')
-      } catch {
-        blindOut = ''
-      }
-      const blindPatchedOk = blindPatched !== blindSource
-      items.push({
-        name: '删掉代码层闸门后总体验证失败（自检失去检出能力）',
-        ok: blindPatchedOk && blind.status !== 0 && blindOut.includes('隔离副本写坏真实 index.js'),
-        detail: blindPatchedOk ? `exit=${blind.status}` : '闸门替换未命中',
-      })
-    }
-  } finally {
-    rmSync(base, { recursive: true, force: true })
-  }
-  return items
-}
+    },
+  },
+  {
+    name: '角色模板被整段删除',
+    expect: '侦察/复核角色模板存在',
+    mutate(surface) {
+      const row = findPresetPlugin(surface.standard, 'persona')
+      row.config.prefix = row.config.prefix.replace(
+        /^[ \t]*=+ ROLE-TEMPLATE:SCOUT:BEGIN =+[ \t]*\r?\n[\s\S]*?^[ \t]*=+ ROLE-TEMPLATE:SCOUT:END =+[ \t]*$\r?\n?/m,
+        '',
+      )
+    },
+  },
+  {
+    name: '双通道互斥说明被删除',
+    expect: '双通道互斥',
+    mutate(surface) {
+      const row = findPresetPlugin(surface.standard, 'persona')
+      row.config.prefix = row.config.prefix.replaceAll(
+        '同一任务不得同时使用 develop 和 rework_task/ask_worker',
+        '可以同时使用 develop 和 rework_task',
+      )
+    },
+  },
+  {
+    name: 'README 任务书退回旧 6 项摘要',
+    expect: 'README 任务书模板含接口/依赖字段',
+    mutate(surface) {
+      surface.readme = String(surface.readme)
+        .replaceAll('接口/依赖：', '接口：')
+        .replaceAll('检查命令：', '命令：')
+        .replaceAll('风险/回退：', '风险：')
+    },
+  },
+  {
+    name: 'P0 证据不足时改为降低路径等级（风险方向写反）',
+    expect: 'P0 没有“证据不足就降低路径等级”的回退指令',
+    mutate(surface) {
+      const row = findPresetPlugin(surface.standard, 'persona')
+      row.config.prefix += '\n- 可验证性：不能证明就降低路径等级并补验收。\n'
+    },
+  },
+  {
+    name: 'P0 允许只有改动摘要也算证据',
+    expect: 'P0 没有“摘要/文件清单就是证据”的错误说法',
+    mutate(surface) {
+      const row = findPresetPlugin(surface.standard, 'persona')
+      row.config.prefix += '\n只有改动摘要也算证据，主窗可以直接通过。\n'
+    },
+  },
+  {
+    name: 'P0 完工证据退化为改动摘要',
+    expect: 'P0 完工必须附实际变更证据',
+    mutate(surface) {
+      const row = findPresetPlugin(surface.standard, 'persona')
+      row.config.prefix = row.config.prefix.replaceAll('实际变更证据', '改动摘要')
+    },
+  },
+  {
+    name: 'P0 文件清单被当成证据',
+    expect: 'P0 不能只给文件清单',
+    mutate(surface) {
+      const row = findPresetPlugin(surface.standard, 'persona')
+      row.config.prefix = row.config.prefix.replaceAll('不能只给文件清单', '只给文件清单也可以作为证据')
+    },
+  },
+  {
+    name: 'client 回退横幅漏掉加载失败',
+    expect: 'client 回退横幅涵盖不可用原因',
+    mutate(surface) {
+      surface.files['client.js'] = String(surface.files['client.js']).replaceAll('加载失败', '加载中')
+    },
+  },
+  {
+    name: 'client 重复叠加保存失败前缀',
+    expect: 'client 不重复叠加“保存失败”前缀',
+    mutate(surface) {
+      surface.files['client.js'] = String(surface.files['client.js']).replace(
+        'formatted ? raw :',
+        'false ? raw :',
+      )
+    },
+  },
+  {
+    name: 'client 保存状态回退为 notice.ok',
+    expect: 'client 仅在 notice.kind=saved 时显示已保存',
+    mutate(surface) {
+      surface.files['client.js'] = String(surface.files['client.js']).replace(
+        "notice.kind === 'saved'",
+        'notice.ok',
+      )
+    },
+  },
+  {
+    name: 'client 修改字段不清旧通知',
+    expect: 'client 修改字段时清除旧通知',
+    mutate(surface) {
+      surface.files['client.js'] = String(surface.files['client.js']).replace(
+        'const update = (patch) => {\n          setNotice(null)\n',
+        'const update = (patch) => {\n',
+      )
+    },
+  },
+  {
+    name: 'client 删除网络错误指引',
+    expect: 'client network 错误给可执行指引',
+    mutate(surface) {
+      surface.files['client.js'] = String(surface.files['client.js']).replaceAll('无法连接 Host', '读取失败')
+    },
+  },
+  {
+    name: '配置写路由删除权威 origin 校验',
+    expect: 'Host 配置写路由使用 webServer.getOrigin() 权威 origin',
+    mutate(surface) {
+      surface.files['index.js'] = String(surface.files['index.js']).replaceAll(
+        'webServer.getOrigin()',
+        'webServer.port',
+      )
+    },
+  },
+  {
+    name: 'client 恢复硬编码颜色',
+    expect: 'client 不保留 hex/rgba 字面颜色',
+    mutate(surface) {
+      surface.files['client.js'] = String(surface.files['client.js']).replace(
+        'var(--dsw-alias-label-primary)',
+        '#333333',
+      )
+    },
+  },
+  {
+    name: 'client 恢复 navigator.language',
+    expect: 'client 不使用 navigator.language',
+    mutate(surface) {
+      surface.files['client.js'] = String(surface.files['client.js']).replace(
+        "const API = '/plugins/dev-plan-presets'",
+        "const API = '/plugins/dev-plan-presets'\nconst legacy = navigator.language",
+      )
+    },
+  },
+  {
+    name: 'client 404 指引被删除',
+    expect: 'client 404 给出可执行指引',
+    mutate(surface) {
+      surface.files['client.js'] = String(surface.files['client.js']).replaceAll('设置路由未注册', '路由错误')
+    },
+  },
+  {
+    name: 'guard 回到 parentSession 判定 fork 为主对话',
+    expect: 'guard 只认 origin=subagent 或 delegationDepth>0',
+    mutate(surface) {
+      surface.files['guard.js'] = String(surface.files['guard.js']).replace(
+        "if (header.origin === 'subagent') return true",
+        "if (header.parentSession) return true",
+      )
+    },
+  },
+  {
+    name: '模型目录 TTL 退回 8s（/state 周期性阻塞）',
+    expect: '模型目录使用 60s 快照 + 后台刷新',
+    mutate(surface) {
+      surface.files['index.js'] = String(surface.files['index.js']).replace(
+        'MODEL_CATALOG_TTL_MS = 60_000',
+        'MODEL_CATALOG_TTL_MS = 8000',
+      )
+    },
+  },
+  {
+    name: 'client 删除 presetChoices 纯函数',
+    expect: 'client 从 /state 读取模型目录并用纯选择函数',
+    mutate(surface) {
+      surface.files['client.js'] = String(surface.files['client.js']).replaceAll(
+        'presetChoices',
+        'removedChoices',
+      )
+    },
+  },
+  {
+    name: 'guard 不再监听 agent/disposed',
+    expect: '模型守门监听 agent/disposed 清理 step guard',
+    mutate(surface) {
+      surface.files['guard.js'] = String(surface.files['guard.js']).replaceAll("'agent/disposed'", "'agent/ignored'")
+    },
+  },
+  {
+    name: '配置写路由删除 Sec-Fetch-Site 校验',
+    expect: 'Host 配置写路由做 Origin/Sec-Fetch-Site 校验',
+    mutate(surface) {
+      surface.files['index.js'] = String(surface.files['index.js']).replaceAll('sec-fetch-site', 'sec-fetch-mode')
+    },
+  },
+  {
+    name: 'P0 授权后只写任务书、不实际调用 develop',
+    expect: 'P0 授权后必须实际调用 develop',
+    mutate(surface) {
+      const row = findPresetPlugin(surface.standard, 'persona')
+      row.config.prefix = row.config.prefix.replaceAll('实际调用 develop', '实际写任务书')
+      row.config.suffix = row.config.suffix.replaceAll('实际调用 develop', '实际写任务书')
+    },
+  },
+  {
+    name: 'P0 文本任务书被当成派工事实',
+    expect: 'P0 文本不是派工',
+    mutate(surface) {
+      const row = findPresetPlugin(surface.standard, 'persona')
+      row.config.prefix = row.config.prefix.replaceAll('文本不是派工', '文本也能算派工')
+      row.config.suffix = row.config.suffix.replaceAll('文本不是派工', '文本也能算派工')
+    },
+  },
+  {
+    name: 'P0 工具未接受也可声称已派出',
+    expect: 'P0 工具接受后才可称已派出',
+    mutate(surface) {
+      const row = findPresetPlugin(surface.standard, 'persona')
+      row.config.prefix = row.config.prefix.replaceAll(
+        '只有工具接受后才可说“已派出 developer”',
+        '没有调用也可以说已派出 developer',
+      )
+    },
+  },
+  {
+    name: 'P0 删除未派工报告',
+    expect: 'P0 未派工如实报告',
+    mutate(surface) {
+      const row = findPresetPlugin(surface.standard, 'persona')
+      row.config.prefix = row.config.prefix.replaceAll('未派工', '已派工')
+      row.config.suffix = row.config.suffix.replaceAll('未派工', '已派工')
+    },
+  },
+  {
+    name: 'preset 显示名回退为旧名',
+    expect: 'preset 显示名为「开发规划与交付」',
+    mutate(surface) {
+      surface.standard.name = '开发规划'
+    },
+  },
+  {
+    name: 'locale/zh 插件显示名回退为旧名',
+    expect: 'locale/zh 插件显示名为「开发规划与交付模式」',
+    mutate(surface) {
+      surface.locale.zh.meta.title = '开发规划与交付'
+    },
+  },
+  {
+    name: 'client 标题回退为旧名',
+    expect: 'client 设置页标题使用预设名「开发规划与交付」',
+    mutate(surface) {
+      surface.files['client.js'] = String(surface.files['client.js']).replaceAll(
+        '开发规划与交付 · 施工设置',
+        '开发规划 · 施工设置',
+      )
+    },
+  },
+  {
+    name: 'README 重新声称显示名未定',
+    expect: 'README 不再声称显示名未定',
+    mutate(surface) {
+      surface.readme = String(surface.readme).replace('显示名已定', '显示名未定')
+    },
+  },
+  {
+    name: 'P0 快速路径被删除',
+    expect: 'P0 风险路由含快速路径',
+    mutate(surface) {
+      const row = findPresetPlugin(surface.standard, 'persona')
+      row.config.prefix = row.config.prefix.replaceAll('快速路径', '慢速路径')
+    },
+  },
+  {
+    name: 'P0 一次性契约的接口/依赖字段被删除',
+    expect: '任务书含接口/依赖',
+    mutate(surface) {
+      const row = findPresetPlugin(surface.standard, 'persona')
+      row.config.prefix = row.config.prefix.replaceAll('接口/依赖', '接口')
+    },
+  },
+  {
+    name: 'P0 静态检查冒充真实验证的禁令被删除',
+    expect: 'P0 禁止静态检查冒充真实验证',
+    mutate(surface) {
+      const row = findPresetPlugin(surface.standard, 'persona')
+      row.config.prefix = row.config.prefix.replaceAll('静态检查不等于真实验证', '静态检查可以代表真实验证')
+    },
+  },
+  {
+    name: 'P0 主窗非阻塞（不轮询）被删除',
+    expect: 'P0 主窗不轮询',
+    mutate(surface) {
+      const row = findPresetPlugin(surface.standard, 'persona')
+      row.config.prefix = row.config.prefix.replaceAll('不轮询', '可以轮询')
+    },
+  },
+  {
+    name: 'P0 验证状态分级被改成二值',
+    expect: 'P0 汇报含验证状态分级',
+    mutate(surface) {
+      const row = findPresetPlugin(surface.standard, 'persona')
+      row.config.prefix = row.config.prefix.replaceAll('verified / partial / failed', '通过/失败')
+    },
+  },
+  {
+    name: 'P0 最终审查责任被外包',
+    expect: 'P0 最终审查责任不外包',
+    mutate(surface) {
+      const row = findPresetPlugin(surface.standard, 'persona')
+      row.config.prefix = row.config.prefix.replaceAll('主窗最终审查责任不外包', '主窗最终审查可外包给 review')
+    },
+  },
+  {
+    name: '版本号未更新',
+    expect: 'version=0.3.0',
+    mutate(surface) {
+      surface.pkg.version = '0.2.0'
+    },
+  },
+  {
+    name: '默认 guardAllSubagents 改成全局',
+    expect: 'settings 默认 guardAllSubagents=false',
+    mutate(surface) {
+      surface.files['settings.js'] = String(surface.files['settings.js']).replace(
+        'guardAllSubagents: false,',
+        'guardAllSubagents: true,',
+      )
+    },
+  },
+  {
+    name: 'client 硬编码 deep-ptc 选项',
+    expect: 'client 不再硬编码 deep-ptc 选项',
+    mutate(surface) {
+      surface.files['client.js'] = String(surface.files['client.js']).replace(
+        "const API = '/plugins/dev-plan-presets'",
+        "const API = '/plugins/dev-plan-presets'\nconst legacyPreset = { value: 'deep-ptc' }",
+      )
+    },
+  },
+  {
+    name: 'client 不再读取模型目录',
+    expect: 'client 从 /state 读取模型目录',
+    mutate(surface) {
+      surface.files['client.js'] = String(surface.files['client.js']).replaceAll('state.modelCatalog', 'state.models')
+    },
+  },
+  {
+    name: 'client 删除 label/帮助文本关联',
+    expect: 'client 使用 label for 与帮助文本关联',
+    mutate(surface) {
+      surface.files['client.js'] = String(surface.files['client.js']).replaceAll('htmlFor', 'data-for')
+    },
+  },
+  {
+    name: '权限防护规则被删除',
+    expect: 'persona 禁止先建后 cd',
+    mutate(surface) {
+      const row = findPresetPlugin(surface.standard, 'persona')
+      row.config.prefix = row.config.prefix.replaceAll('不得先以其他目录 spawn', '可以先以其他目录 spawn')
+    },
+  },
+  {
+    name: 'dev-plan 自引用不再回退',
+    expect: 'dev-plan 自身被拒绝，避免递归',
+    mutate(surface) {
+      surface.selfFallback.fallback = false
+      surface.selfFallback.reason = ''
+    },
+  },
+  {
+    name: '任意 preset 被限制回 standard',
+    expect: '任意有效 preset 可作 develop',
+    mutate(surface) {
+      findTool(surface.custom, 'develop').config.agentPreset = 'standard'
+    },
+  },
+  {
+    name: 'Host 不返回预设目录',
+    expect: 'Host 返回真实预设目录',
+    mutate(surface) {
+      surface.files['index.js'] = String(surface.files['index.js']).replaceAll('presets:', 'presetRows:')
+    },
+  },
+  {
+    name: '代码里重新引入 @deepseek-ai import',
+    expect: 'index.js 不 import @deepseek-ai/*',
+    mutate(surface) {
+      surface.files['index.js'] = "import z from '@deepseek-ai/schemastery'\n" + surface.files['index.js']
+    },
+  },
+]
 
 async function main() {
-  const yaml = loadYaml()
-  if (!yaml) {
-    console.error('无法加载 js-yaml。请在本插件目录执行：npm i -D js-yaml')
-    process.exit(2)
-  }
-
-  const data = loadData(ROOT, yaml)
-  const results = checksFor(data)
+  const surface = await loadSurface()
+  const results = checksFor(surface)
   for (const item of results) {
     if (!item.ok) console.log(`FAIL  ${item.label}${item.detail ? ` — ${item.detail}` : ''}`)
     else if (VERBOSE) console.log(`PASS  ${item.label}${item.detail ? ` — ${item.detail}` : ''}`)
   }
   const failures = results.filter((item) => !item.ok).length
-  const passes = results.length - failures
   console.log('')
-  console.log(`静态声明检查：${passes} 通过 / ${failures} 失败`)
+  console.log(`静态合同检查：${results.length - failures} 通过 / ${failures} 失败`)
 
-  // 语法 + import/apply smoke
-  const indexFile = resolve(ROOT, 'index.js')
-  const syntax = runSyntaxCheck(indexFile)
-  console.log(
-    `node --check index.js：${syntax.ok ? 'PASS' : `FAIL（status=${syntax.status}${syntax.error ? `, ${syntax.error}` : ''}）`}`,
-  )
-
-  let smokeOk = true
-  let smokeDetail = 'ok'
-  try {
-    const moduleUrl = `${pathToFileURL(indexFile).href}?verify=${Date.now()}`
-    const mod = await import(moduleUrl)
-    if (typeof mod.apply !== 'function') throw new Error('未导出 apply')
-    const warnings = []
-    mod.apply({ logger: { warn: (message) => warnings.push(String(message)) } })
-    smokeDetail = warnings.length === 0 ? '无告警' : `告警 ${warnings.length} 条：${warnings.join(' | ')}`
-    smokeOk = warnings.length === 0
-  } catch (error) {
-    smokeOk = false
-    smokeDetail = error instanceof Error ? error.message : String(error)
+  // 语法层
+  let syntaxOk = true
+  for (const file of RUNTIME_FILES) {
+    const result = syntaxCheck(join(ROOT, file))
+    console.log(`node --check ${file}：${result.ok ? 'PASS' : `FAIL（status=${result.status}${result.error ? `, ${result.error}` : ''}）`}`)
+    if (!result.ok) syntaxOk = false
   }
-  console.log(`import + apply() smoke：${smokeOk ? 'PASS' : 'FAIL'}（${smokeDetail}）`)
+  // 元检查：证明 --check 闸门不是恒通过。故意写坏一个临时文件，必须 FAIL。
+  const metaDir = join(ROOT, '.verify-tmp')
+  mkdirSync(metaDir, { recursive: true })
+  const brokenFile = join(metaDir, 'broken-syntax.mjs')
+  writeFileSync(brokenFile, 'export const = ;\n', 'utf8')
+  const brokenSyntax = syntaxCheck(brokenFile)
+  rmSync(metaDir, { recursive: true, force: true })
+  const syntaxGateOk = !brokenSyntax.ok
+  console.log(`语法闸门自检（坏文件必须 FAIL）：${syntaxGateOk ? 'PASS' : 'FAIL'}`)
+  syntaxOk = syntaxOk && syntaxGateOk
 
-  // 变异检查
+  // 行为层
+  const behavior = await behaviorChecks()
+  for (const item of behavior) {
+    if (!item.ok) console.log(`FAIL  ${item.label}${item.detail ? ` — ${item.detail}` : ''}`)
+    else if (VERBOSE) console.log(`PASS  ${item.label}`)
+  }
+  const behaviorFailures = behavior.filter((item) => !item.ok).length
+  console.log(`真实模块行为检查：${behavior.length - behaviorFailures} 通过 / ${behaviorFailures} 失败`)
+
+  // 变异层
   let detected = 0
   const missed = []
-  const detectedNames = []
   for (const mutation of MUTATIONS) {
-    const mutated = clone(data)
+    const mutated = clone(surface)
+    let outcome
     try {
       mutation.mutate(mutated)
+      outcome = checksFor(mutated)
     } catch (error) {
-      missed.push(`${mutation.name}（变异本身抛错：${error instanceof Error ? error.message : String(error)}）`)
+      missed.push(`${mutation.name}（变异本身抛错：${String(error?.message ?? error)}）`)
       continue
     }
-    const outcome = checksFor(mutated).filter((item) => !item.ok)
-    const hits = outcome.filter((item) => item.label.includes(mutation.expect))
+    const hits = outcome.filter((item) => !item.ok && item.label.includes(mutation.expect))
     if (hits.length > 0) {
       detected += 1
-      detectedNames.push(`${mutation.name} ← ${hits.map((item) => item.label).join('；')}`)
-    } else missed.push(`${mutation.name}（期望 ${mutation.expect} 报错，实际未报）`)
+      if (VERBOSE) console.log(`PASS  变异：${mutation.name} ← ${hits.map((item) => item.label).join('；')}`)
+    } else {
+      missed.push(`${mutation.name}（期望 ${mutation.expect} 报错，实际未报）`)
+    }
   }
-
-  // 自检（真实文件层）：默认跑；嵌套调用时跳过，避免递归
-  const selfChecks = process.env.VERIFY_SKIP_SELFCHECK === '1' ? [] : runSelfChecks()
-  for (const item of selfChecks) {
-    if (item.ok) {
-      detected += 1
-      detectedNames.push(item.name)
-    } else missed.push(`${item.name}（${item.detail}）`)
-  }
-
-  const totalMutations = MUTATIONS.length + selfChecks.length
-  console.log(`负向变异：${detected}/${totalMutations} 检出`)
-  if (VERBOSE) for (const name of detectedNames) console.log(`PASS  变异：${name}`)
+  console.log(`负向变异：${detected}/${MUTATIONS.length} 检出`)
   for (const item of missed) console.log(`FAIL  ${item}`)
 
-  const ok = failures === 0 && syntax.ok && smokeOk && missed.length === 0
+  const ok = failures === 0 && syntaxOk && behaviorFailures === 0 && missed.length === 0
   console.log('')
-  console.log(`结论：${ok ? 'PASS（声明层 + 代码层；运行期行为见 README「验证」的手工清单）' : 'FAIL'}`)
+  console.log(`结论：${ok ? 'PASS（声明层 + 代码层 + 行为层；宿主/GUI 运行期行为见 README「验证」手工清单）' : 'FAIL'}`)
   process.exit(ok ? 0 : 1)
 }
 
 const invokedDirectly =
   process.argv[1] &&
   pathToFileURL(resolve(process.argv[1])).href === pathToFileURL(fileURLToPath(import.meta.url)).href
-if (invokedDirectly) {
-  await main()
-}
+if (invokedDirectly) await main()

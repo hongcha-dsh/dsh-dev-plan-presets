@@ -1,10 +1,22 @@
 # dsh-dev-plan-presets — bundle 根补丁
 #
-# 本包只声明 Agent preset，不注册任何模型可见工具。
-# 真正的 preset 声明在 presets/dev-plan.patch.yml，由 package.json 的 dsh.bundle.patch 依次应用。
+# 0.3.0 起本包是 Host 插件：dev-plan preset 由 index.js 在运行时通过
+# ctx.agentPresets.register() 动态注册，以便按设置切换施工子代理 preset。
+# 这里**只挂根插件一行**，不再静态声明 @deepseek-ai/dsh-agent-preset；
+# 否则会与动态注册重名，导致 preset 注册失败。
 #
-# 这一行只是把本包挂成一个可见的插件行：插件管理页能看见它、能禁用/卸载它，
-# 出问题时也能在插件页确认它确实被加载。index.js 不做任何工具、路由或提示词注入。
+# 想改配置优先用插件页的本插件设置（写入 configEditor），不要手改 profile 的
+# cordis.patch.yml；手工写 config 也合法，但会被完整校验。
 - insert:
     - id: dev-plan-presets
       name: dsh-dev-plan-presets
+      config:
+        developMode: standard
+        childProvider: dsh-opencode-go
+        childModel: deepseek-v4.1-flash
+        childReasoningEffort: ''
+        modelGuardMode: pin
+        killOnViolation: true
+        honorExplicit: false
+        audit: true
+        guardAllSubagents: false
