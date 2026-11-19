@@ -2,7 +2,7 @@
 
 给 DeepSeek Harness（DSH）用的「开发规划与交付」Agent preset 包：昂贵主模型只做规划、派工与复核；实际施工交给 `develop` 子代理并直接汇报；内置子代理模型守门，避免子代理误继承昂贵主模型。
 
-当前版本 **0.3.0**。0.3.0 是一次结构性升级：从「静态 YAML 声明」改为「Host 插件动态注册 + 设置页」，并吸收了旧插件 `dsh-subagent-model-pin` 的模型钉能力。施工子代理不再限于两个写死的模式，而是从宿主已安装的 DSH 预设中选择；模型守门默认只管理「开发规划与交付」会话派出的子代理。内部 preset id 仍是 `dev-plan`；插件管理器显示名是「开发规划与交付模式」，preset 名称仍是「开发规划与交付」。
+当前版本 **0.4.0**。在 0.3.0「Host 插件动态注册 + 设置页 + 子代理模型守门」基础上，0.4.0 聚焦全局提速与工程优化：主窗 persona 精简至 ≤ 6,000 字符（将紧凑版 `recon`/`review`/`scribe` 约束融入主预设并明确标注**仅给子代理用**，不在 DSH 预设列表暴露多余子预设选项）；新增可选受控的 `mainToolMode`（`none` / `readonly` / `ask-edit`，永不挂 Shell）与步数提醒阈值 `mainStepWarnThreshold`；设置页改用 `stateVersion`/`stateTag` + ETag `304` 与 700ms/30s 自适应轮询及目录空闲预热。内部 preset id 仍是 `dev-plan`；插件管理器显示名是「开发规划与交付模式」，preset 名称仍是「开发规划与交付」。
 
 - [这个包解决什么问题](#这个包解决什么问题)
 - [安装](#安装)
@@ -52,9 +52,9 @@
 
 | 工具 | 用途 | 子代理 preset | 工具面 |
 |---|---|---|---|
-| `recon` | 查证、遍历、搜索仓库事实 | `standard` | 完整 standard（靠角色模板约束只读） |
-| `review` | 独立复核、找问题、证伪关键事实 | `standard` | 完整 standard（靠角色模板约束只读） |
-| `scribe` | 把定稿文档逐字落盘 | `standard` | 完整 standard（靠角色模板约束写入范围） |
+| `recon` | 查证、遍历、搜索仓库事实 | `standard` | 完整 standard（由嵌入主预设的紧凑模板约束只读，仅给子代理用） |
+| `review` | 独立复核、找问题、证伪关键事实 | `standard` | 完整 standard（由嵌入主预设的紧凑模板约束只读，仅给子代理用） |
+| `scribe` | 把定稿文档逐字落盘 | `standard` | 完整 standard（由嵌入主预设的紧凑模板约束写入范围，仅给子代理用） |
 | `develop` | 实际施工、跑测试、修缺陷 | 任意可用预设（默认 `standard`） | 由所选 preset 决定 |
 
 四个工具的共同配置：
@@ -65,7 +65,7 @@
 - 不设 `allowedAgentPresets`；
 - `agentOptions` 来自同一份设置真源：`childProvider` / `childModel` / 可选 `childReasoningEffort`。
 
-`recon` / `review` / `scribe` 永远是 `standard`；只有 `develop` 会随设置切换。这样即使所选预设出问题，取证与复核通道也不受影响。
+`recon` / `review` / `scribe` 始终运行于 `standard`，并将紧凑版角色约束融入主预设且明确标注**仅给子代理用**（避免在 DSH 宿主预设列表出现多余的内部预设）；只有 `develop` 会随设置切换。`dev-plan` 等内部 id 在 `developMode` 选择器与运行期自引用保护中禁用。
 
 ## 主窗行为合同
 
@@ -131,6 +131,8 @@
 | `honorExplicit` | `false` | 是否尊重子代理创建时的显式非父级路由 |
 | `audit` | `true` | 是否写结构化审计日志（只含路由与事件，不含凭据） |
 | `guardAllSubagents` | `false` | 默认只守 `dev-plan` 父会话派出的子代理；勾选后恢复全局子代理守门 |
+| `mainToolMode` | `ask-edit` | 主窗工具权限：`ask-edit`（默认，小范围只读核验 + 经用户当轮明确同意后允许 `read`/`edit`/`write` 局部微改，永不挂 Shell）/ `readonly`（仅 `glob`/`grep` 定点检索，不可改文件）/ `none`（纯规划派工，最省主模型额度） |
+| `mainStepWarnThreshold` | `6` | 仅在 `mainToolMode !== 'none'` 时生效（`2..30` 整数）：单轮连续步数超阈值只温和提醒转交子代理，绝不 `select`/`cancel`/`reject` 主会话 |
 
 保存路径：Client → Host `/plugins/dev-plan-presets/config` → 严格校验（手写 Standard Schema）→ `ctx.get('configEditor').edit(entry, ...)` → 写回 profile patch → Loader 重建插件。**不手改 profile 的 `cordis.patch.yml`**，也不在插件目录另写 `config.json`。设置页自己的读取/展示走 `/plugins/dev-plan-presets/state`。
 
@@ -310,6 +312,11 @@ node --check client.js
 
 ### 仍未验证（不得写成已通过）
 
+- [ ] **0.4.0 新增真机 Host 验收项**：
+  - [ ] 通过 `plugin_manager` 重新安装/启用 0.4.0 后，新建 `dev-plan` 会话，验证 `recon` 实际使用 `dev-plan-scout` 且主窗不再输出千字模板；
+  - [ ] 对比真实任务体感耗时（规划输出长度、首次 `recon` 到回复耗时、`develop` 派工前等待时间）；
+  - [ ] 在设置页分别切换 `mainToolMode` 为 `readonly` 与 `ask-edit`，新建会话验证主窗只读定位与“经用户同意后局部微改”行为，且主会话模型不被守门篡改；
+  - [ ] 验证设置页打开时模型列表即时显示、DevTools Network 面板稳态下不再每 4 秒刷 `/state`（转为 30s 保活 + `304`）。
 - [ ] 插件页“已安装 → 开发规划与交付模式 → 包含组件 → 行标题/右箭头”入口、设置页真实渲染、明暗主题、语言切换、ARIA 与原生焦点环；
 - [ ] 设置页 404 降级、连续 404 停止轮询、手动刷新与 network 错误指引在真实浏览器中的表现（Host 路由已 200，但客户端 UI 未验）；
 - [ ] 真实浏览器交互（按钮/焦点/提示）；无 Origin 非浏览器客户端保存、非监听 host、更多代理/地址形态（真实 HTTP 已覆盖 same-origin、localhost loopback alias、DNS rebinding 形状、错误端口；fake req 全矩阵不能替代真实浏览器）；
@@ -332,9 +339,9 @@ Windows 受限沙箱里 `node --test` 默认会为每个测试文件 spawn 子�
 
 改 persona / 模板时注意：
 
-- `===== ROLE-TEMPLATE:SCOUT:BEGIN/END =====` 与 `===== ROLE-TEMPLATE:SCRIBE:BEGIN/END =====` 是稳定标记，自检按它抽取正文；
-- 侦察模板的允许工具必须是精确六项：`read`、`read_image`、`glob`、`grep`、`web_search`、`web_fetch`；
-- 文书模板保留 6 条编号规则，规则 3/5/6 有精确断言；
+- 主窗 `persona.prefix + persona.suffix` 预算上限为 **6,000 字符**，避免长 prompt 拖慢 TTFT 与推理 CoT；
+- 正常启用内部子预设时，主窗 `prefix` 不得再内联 `ROLE-TEMPLATE:SCOUT:BEGIN` / `ROLE-TEMPLATE:SCRIBE:BEGIN`；
+- `dev-plan-scout` 与 `dev-plan-scribe` 绝不挂载 `bash`/`pwsh`/`workflow`/`jobs`/`schedule`/`goal`/`skill`/`todo`/`subagent`/`plan-mode`；
 - persona 不写 `{{...}}` 模板变量。
 
 ## 许可证

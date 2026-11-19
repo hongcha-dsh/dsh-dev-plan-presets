@@ -20,3 +20,5 @@
         honorExplicit: false
         audit: true
         guardAllSubagents: false
+        mainToolMode: ask-edit
+        mainStepWarnThreshold: 6

@@ -4,11 +4,12 @@
 
 一个给昂贵主模型用的 DSH Agent preset 包。主窗只做规划、派工与复核，实际施工交给 `develop` 子代理；内置子代理模型守门，避免子代理误继承昂贵主模型。
 
-0.3.0 的结构变化：
+0.4.0 的结构与提速优化：
 
-- 从「bundle 里静态写一份 `@deepseek-ai/dsh-agent-preset` 行」改为「Host 插件在运行时 `ctx.agentPresets.register()` 动态注册」；
+- 从「bundle 里静态写一份 `@deepseek-ai/dsh-agent-preset` 行」改为「Host 插件在运行时 `ctx.agentPresets.register()` 动态注册」，只注册单个 `dev-plan` 预设，不向 DSH 预设列表暴露多余子预设；
+- 主窗 persona 压缩至 ≤ 6,000 字符（SSOT 零重复），并将紧凑版侦察/文书模板融入主预设且明确标注**仅给子代理用**；
 - 新增 `develop` 委派工具，让主窗直接派工、收汇报、派独立复核、再返工给同一 `developer`；
-- 新增插件设置页（`plugins.row.config`）与 Host 路由：施工方式从宿主已安装的任意 DSH 预设中选择，provider/model 从宿主目录联动选择；
+- 新增插件设置页（`plugins.row.config`）与 Host 路由：支持 `stateVersion`/`stateTag` + ETag `304`、700ms/30s 自适应轮询、`modelCatalog` 空闲预热、可选 `mainToolMode`（`none`/`readonly`/`ask-edit`，永不挂 Shell）与主窗步数软提醒阈值 `mainStepWarnThreshold`；
 - 吸收 `dsh-subagent-model-pin` 的子代理模型守门能力；
 - preset 真源从 YAML 迁移到 `preset.js`，运行期不依赖 `js-yaml` 或 `@deepseek-ai/schemastery`。
 
@@ -31,7 +32,7 @@
 - 不设 `allowedAgentPresets`；
 - `agentOptions` 来自同一设置真源（`childProvider` / `childModel` / 可选 `childReasoningEffort`）。
 
-`recon` / `review` / `scribe` 永远绑定 `standard`；只有 `develop` 随设置切换。所选预设由宿主 `agentPresets` 目录决定，设置页不维护第二份白名单。
+`recon` / `review` / `scribe` 始终绑定 `standard`，紧凑版约束模板直接融入主预设并明确标注**仅给子代理用**（避免在 DSH 预设列表显示多余子预设）；只有 `develop` 随设置切换。所选预设由宿主 `agentPresets` 目录决定，设置页不维护第二份白名单，并禁用内部预设 id。
 
 ## 三、主窗合同
 
@@ -65,6 +66,8 @@
 | `honorExplicit` | `false` | 是否尊重子代理显式路由 |
 | `audit` | `true` | 是否写审计日志 |
 | `guardAllSubagents` | `false` | 默认只守 dev-plan 子代理；勾选后全局 |
+| `mainToolMode` | `ask-edit` | 主窗工具权限：`ask-edit`（默认，`read`/`edit`/`write` 经同意局部微改，无 Shell）/ `readonly`（仅 `glob`/`grep`）/ `none`（纯规划派工） |
+| `mainStepWarnThreshold` | `6` | `mainToolMode !== 'none'` 时主窗单轮步数软提醒阈值（`2..30`，永不改模型/不取消） |
 
 保存链路：Client → `/plugins/dev-plan-presets/config` → 严格 Standard Schema 校验 → `configEditor.edit(entry, ...)` → profile patch → Loader 重建。不手改 profile 的 `cordis.patch.yml`，也不在插件目录写 `config.json`。
 
@@ -176,6 +179,11 @@
 
 **未验证**（不得写成已通过）：
 
+- 0.4.0 新增真机 Host 验收项：
+  - 通过 `plugin_manager` 重新安装/启用 0.4.0 后，新建 `dev-plan` 会话验证 `recon` 实际使用 `dev-plan-scout` 且主窗不再输出千字模板；
+  - 对比真实任务体感耗时（规划输出长度、首次 `recon` 到回复耗时、`develop` 派工前等待时间）；
+  - 在设置页切换 `mainToolMode` 为 `readonly` / `ask-edit`，新建会话验证主窗只读定位与“经用户同意后局部微改”行为，且主会话模型不被守门篡改；
+  - 验证设置页打开时模型列表即时显示、DevTools Network 面板稳态下转为 30s 保活 + `304`（不再每 4 秒全量刷新 `/state`）。
 - 插件页“已安装 → 开发规划与交付模式 → 包含组件 → 行标题/右箭头”入口、设置页真实渲染、明暗主题、语言切换、ARIA/焦点环；
 - 设置页 404 降级/停止轮询/手动刷新/network 指引的真实浏览器表现；
 - 真实浏览器交互（按钮/焦点/提示）；无 Origin 非浏览器客户端、非监听 host、更多代理/地址形态（真实 HTTP 已覆盖 same-origin、localhost alias、DNS rebinding 形状、错误端口；fake req 全矩阵不等于真实浏览器）；

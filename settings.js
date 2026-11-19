@@ -20,6 +20,13 @@
 /** 模型守门模式。off = 完全不管；audit = 只记录；pin = 钉住并可按设置打断。 */
 export const GUARD_MODES = Object.freeze(['off', 'audit', 'pin'])
 
+/** 主窗工具权限档位。none = 纯规划派工；readonly = 定点只读核验；ask-edit = 经用户同意后允许局部微改（永不挂 Shell）。 */
+export const MAIN_TOOL_MODES = Object.freeze(['none', 'readonly', 'ask-edit'])
+
+/** 主窗连续实操步数软提醒阈值范围（仅在 mainToolMode !== 'none' 时生效）。 */
+export const MIN_MAIN_STEP_WARN_THRESHOLD = 2
+export const MAX_MAIN_STEP_WARN_THRESHOLD = 30
+
 /** 默认路由：与 0.2.0 及旧 dsh-subagent-model-pin 保持一致。 */
 export const DEFAULT_CHILD_PROVIDER = 'dsh-opencode-go'
 export const DEFAULT_CHILD_MODEL = 'deepseek-v4.1-flash'
@@ -50,6 +57,10 @@ export const DEFAULT_SETTINGS = Object.freeze({
    * 主会话始终不守门。
    */
   guardAllSubagents: false,
+  /** 主窗工具权限：ask-edit（默认，小范围只读+经同意局部微改，永不挂 Shell）/ readonly / none。 */
+  mainToolMode: 'ask-edit',
+  /** mainToolMode !== 'none' 时，主会话单轮连续步数超过该阈值后温和提醒转交子代理。 */
+  mainStepWarnThreshold: 6,
 })
 
 const isPlainObject = (value) =>
@@ -90,6 +101,15 @@ export function normalizeSettings(raw) {
       input.guardAllSubagents === undefined
         ? DEFAULT_SETTINGS.guardAllSubagents
         : input.guardAllSubagents === true,
+    mainToolMode: MAIN_TOOL_MODES.includes(input.mainToolMode)
+      ? input.mainToolMode
+      : DEFAULT_SETTINGS.mainToolMode,
+    mainStepWarnThreshold:
+      Number.isInteger(input.mainStepWarnThreshold) &&
+      input.mainStepWarnThreshold >= MIN_MAIN_STEP_WARN_THRESHOLD &&
+      input.mainStepWarnThreshold <= MAX_MAIN_STEP_WARN_THRESHOLD
+        ? input.mainStepWarnThreshold
+        : DEFAULT_SETTINGS.mainStepWarnThreshold,
   }
 }
 
@@ -126,6 +146,20 @@ export function validateSettings(raw) {
     if (input[field] !== undefined && typeof input[field] !== 'boolean') {
       issue(field, 'must be a boolean')
     }
+  }
+  if (input.mainToolMode !== undefined && !MAIN_TOOL_MODES.includes(input.mainToolMode)) {
+    issue('mainToolMode', `must be one of ${MAIN_TOOL_MODES.join(', ')}`)
+  }
+  if (
+    input.mainStepWarnThreshold !== undefined &&
+    (!Number.isInteger(input.mainStepWarnThreshold) ||
+      input.mainStepWarnThreshold < MIN_MAIN_STEP_WARN_THRESHOLD ||
+      input.mainStepWarnThreshold > MAX_MAIN_STEP_WARN_THRESHOLD)
+  ) {
+    issue(
+      'mainStepWarnThreshold',
+      `must be an integer between ${MIN_MAIN_STEP_WARN_THRESHOLD} and ${MAX_MAIN_STEP_WARN_THRESHOLD}`,
+    )
   }
   if (issues.length > 0) return { issues }
   return { value: normalizeSettings(input) }

@@ -13,7 +13,7 @@
  * 本文件不 import Node 内置模块，也不 import @deepseek-ai/*，便于单测。
  */
 
-import { routeMatches, routeOf } from './settings.js'
+import { DEFAULT_SETTINGS, routeMatches, routeOf } from './settings.js'
 import { PRESET_ID } from './preset.js'
 
 const MAX_TEXT = 240
@@ -142,10 +142,12 @@ const violationText = (got, want) =>
  * agent 作用域销毁和插件卸载两边都会调用同一个幂等 disposer。
  * @returns 幂等卸载函数；注册失败时返回 undefined。
  */
-const installStepGuard = (ctx, agent, settings, hooks, target) => {
+const installStepGuard = (ctx, agent, settings, hooks, target, onDispose) => {
   let stopped = false
   let active = true
   const handler = async (payload, next) => {
+    if (settings.modelGuardMode === 'off') return next()
+    if (stopped) return { kind: 'reject' }
     const decision = await next()
     try {
       if (decision?.kind === 'reject') return decision
@@ -185,6 +187,11 @@ const installStepGuard = (ctx, agent, settings, hooks, target) => {
     } catch {
       /* ignore */
     }
+    try {
+      if (typeof onDispose === 'function') onDispose(agent)
+    } catch {
+      /* ignore */
+    }
   }
   // agent 作用域销毁时也释放；插件总 disposer 会先/后调用同一个 dispose，靠 active 幂等。
   try {
@@ -202,8 +209,16 @@ const installStepGuard = (ctx, agent, settings, hooks, target) => {
  * @param {import('./settings.js').DEFAULT_SETTINGS} settings
  * @param {{ recordViolation?: Function, audit?: Function, warn?: Function }} hooks
  * @param {{ provider: string, model: string, reasoningEffort?: string }} [target]
+ * @param {(agent: any) => void} [onDispose]
  */
-export function onAgentCreated(ctx, agent, settings, hooks = {}, target = routeOf(settings)) {
+export function onAgentCreated(
+  ctx,
+  agent,
+  settings,
+  hooks = {},
+  target = routeOf(settings),
+  onDispose,
+) {
   if (!agent || settings.modelGuardMode === 'off') return
   const header = agent.session?.header
   // 主会话在这里被挡掉：没有父会话，也不是 origin=subagent。
@@ -234,7 +249,7 @@ export function onAgentCreated(ctx, agent, settings, hooks = {}, target = routeO
   })()
 
   if (mode === 'audit') {
-    const dispose = installStepGuard(ctx, agent, settings, hooks, target)
+    const dispose = installStepGuard(ctx, agent, settings, hooks, target, onDispose)
     hooks?.audit?.('would-pin', {
       agent: shortId(agent?.id),
       from: describeRoute(current),
@@ -260,7 +275,7 @@ export function onAgentCreated(ctx, agent, settings, hooks = {}, target = routeO
 
   // pin：守卫必须在 select 尝试之前装好。这样即使 select 不存在/抛错且 kill=false，
   // 后续 pre-step 仍能记录越界，而不是变成完全不设防。
-  const dispose = installStepGuard(ctx, agent, settings, hooks, target)
+  const dispose = installStepGuard(ctx, agent, settings, hooks, target, onDispose)
 
   // 已经在目标路由上：保留守卫防后续漂移即可。
   if (routeMatches(current, target)) {
@@ -316,7 +331,9 @@ export function installModelGuard(ctx, settings, hooks = {}) {
   const listener = (payload) => {
     const agent = payload?.agent
     try {
-      const dispose = onAgentCreated(ctx, agent, settings, hooks, target)
+      const dispose = onAgentCreated(ctx, agent, settings, hooks, target, (targetAgent) => {
+        steps.delete(targetAgent)
+      })
       if (typeof dispose === 'function' && agent && typeof agent === 'object') {
         release(agent)
         steps.set(agent, dispose)
@@ -353,6 +370,172 @@ export function installModelGuard(ctx, settings, hooks = {}) {
     }
     const pending = [...steps.values()]
     steps.clear()
+    for (const dispose of pending) {
+      try {
+        dispose()
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+}
+
+const turnSignatureOf = (agent, payload) => {
+  if (payload && payload.turnId !== undefined) return `turn:${String(payload.turnId)}`
+  if (payload && payload.userMessageId !== undefined) {
+    return `userMsg:${String(payload.userMessageId)}`
+  }
+  const messages = agent?.session?.messages
+  if (!Array.isArray(messages)) return 'default'
+  let userCount = 0
+  let lastUserId = ''
+  for (const msg of messages) {
+    if (msg?.role === 'user' && msg?.source?.kind !== 'dev-plan-presets') {
+      userCount += 1
+      if (msg.id !== undefined) lastUserId = String(msg.id)
+    }
+  }
+  return `users:${userCount}:${lastUserId}`
+}
+
+/**
+ * 主会话步数预算软提醒（独立于 modelGuardMode）。
+ * 仅在 settings.mainToolMode !== 'none' 时激活；
+ * 仅监听非子代理且 preset=dev-plan 的主会话，在单轮连续步数超阈值时温和注入提示，
+ * 绝不调用 agent.model.select、绝不 cancel、绝不 reject。
+ *
+ * @returns 幂等总卸载函数。
+ */
+export function installMainStepBudget(ctx, settings, hooks = {}) {
+  const mode = settings?.mainToolMode ?? DEFAULT_SETTINGS.mainToolMode
+  if (mode === 'none') return () => {}
+  const threshold =
+    Number.isInteger(settings?.mainStepWarnThreshold) && settings.mainStepWarnThreshold >= 2
+      ? settings.mainStepWarnThreshold
+      : 6
+
+  const tracked = new Map()
+  let active = true
+
+  const release = (agent) => {
+    const dispose = tracked.get(agent)
+    if (dispose === undefined) return
+    tracked.delete(agent)
+    try {
+      dispose()
+    } catch {
+      /* ignore */
+    }
+  }
+
+  const attach = (agent) => {
+    if (!agent || typeof agent.ctx?.on !== 'function') return
+    if (isSubagentHeader(agent.session?.header)) return
+    if (presetOfSession(ctx, agent.session) !== PRESET_ID) return
+
+    let stepCount = 0
+    let warned = false
+    let lastTurn = ''
+    let lastStepAt = 0
+    let stepActive = true
+
+    let off
+    try {
+      off = agent.ctx.on('agent/pre-step', async (payload, next) => {
+        const decision = await next()
+        try {
+          if (decision?.kind === 'reject') return decision
+          const now = Date.now()
+          const turn = turnSignatureOf(agent, payload)
+          if (turn !== lastTurn || (lastStepAt > 0 && now - lastStepAt > 60_000)) {
+            lastTurn = turn
+            stepCount = 0
+            warned = false
+          }
+          lastStepAt = now
+          stepCount += 1
+          if (stepCount > threshold && !warned) {
+            warned = true
+            const message =
+              `💡 [dev-plan-presets] 当前主模型在本轮已连续执行 ${stepCount} 步（提醒阈值 ${threshold}），` +
+              `建议将后续探索或修改转交 recon / develop 子代理以节省主模型额度。`
+            hooks?.audit?.('main-step-budget-warn', {
+              agent: shortId(agent?.id),
+              steps: stepCount,
+              threshold,
+              mode,
+            })
+            if (typeof agent?.inject === 'function') {
+              agent.inject({
+                content: [{ type: 'text', text: message }],
+                source: { kind: 'dev-plan-presets' },
+              })
+            }
+          }
+        } catch {
+          /* 软提醒绝不中断主会话 */
+        }
+        return decision
+      })
+    } catch {
+      return
+    }
+
+    const dispose = () => {
+      if (!stepActive) return
+      stepActive = false
+      tracked.delete(agent)
+      try {
+        if (typeof off === 'function') off()
+      } catch {
+        /* ignore */
+      }
+    }
+
+    release(agent)
+    tracked.set(agent, dispose)
+    try {
+      if (typeof agent.ctx.effect === 'function') agent.ctx.effect(() => dispose)
+    } catch {
+      /* ignore */
+    }
+  }
+
+  const createdListener = (payload) => {
+    try {
+      attach(payload?.agent)
+    } catch {
+      /* ignore */
+    }
+  }
+  const disposedListener = (payload) => {
+    try {
+      release(payload?.agent)
+    } catch {
+      /* ignore */
+    }
+  }
+
+  const offs = []
+  try {
+    offs.push(ctx.on('agent/created', createdListener))
+    offs.push(ctx.on('agent/disposed', disposedListener))
+  } catch (error) {
+    hooks?.warn?.(`无法注册主窗步数提醒：${String(error?.message ?? error)}`)
+  }
+
+  return () => {
+    if (!active) return
+    active = false
+    for (const off of offs) {
+      try {
+        if (typeof off === 'function') off()
+      } catch {
+        /* ignore */
+      }
+    }
+    const pending = [...tracked.values()]
+    tracked.clear()
     for (const dispose of pending) {
       try {
         dispose()

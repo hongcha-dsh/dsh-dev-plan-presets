@@ -116,6 +116,108 @@ window.__ModuleLoader__.load({
         }),
         noticeOk: { fontSize: 12, color: 'var(--dsw-alias-label-secondary)', lineHeight: 1.5 },
         noticeError: { fontSize: 12, color: 'var(--dsw-alias-state-error-primary)', lineHeight: 1.5 },
+        badge: {
+          fontSize: 11,
+          padding: '1px 7px',
+          borderRadius: 'var(--dsw-radius-xs)',
+          border: '1px solid var(--dsw-alias-border-l3)',
+          background: 'var(--dsw-alias-bg-layer-2)',
+          color: 'var(--dsw-alias-label-secondary)',
+          fontFamily: 'var(--ds-font-family-code)',
+        },
+        summaryBar: {
+          display: 'flex',
+          gap: 8,
+          flexWrap: 'wrap',
+          padding: '8px 10px',
+          borderRadius: 'var(--dsw-radius-sm)',
+          border: '1px solid var(--dsw-alias-border-l2)',
+          background: 'var(--dsw-alias-bg-layer-1)',
+        },
+        summaryItem: {
+          display: 'flex',
+          gap: 5,
+          alignItems: 'center',
+          fontSize: 12,
+          color: 'var(--dsw-alias-label-secondary)',
+          paddingRight: 8,
+        },
+        summaryKey: { color: 'var(--dsw-alias-label-tertiary)' },
+        modeGrid: {
+          display: 'grid',
+          gridTemplateColumns: 'repeat(auto-fit, minmax(185px, 1fr))',
+          gap: 8,
+        },
+        modeCard: {
+          border: '1px solid var(--dsw-alias-border-l2)',
+          borderRadius: 'var(--dsw-radius-xs)',
+          padding: '8px 10px',
+          background: 'var(--dsw-alias-bg-layer-1)',
+          display: 'flex',
+          flexDirection: 'column',
+          gap: 4,
+          textAlign: 'left',
+          cursor: 'pointer',
+          font: 'inherit',
+          color: 'var(--dsw-alias-label-primary)',
+        },
+        modeCardActive: {
+          border: '1px solid var(--dsw-alias-button-primary-fill)',
+          borderLeft: '3px solid var(--dsw-alias-button-primary-fill)',
+          background: 'var(--dsw-alias-bg-layer-2)',
+        },
+        modeCardHead: {
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'center',
+          gap: 6,
+          fontSize: 12,
+          fontWeight: 600,
+          color: 'var(--dsw-alias-label-primary)',
+        },
+        modeCardDesc: {
+          fontSize: 11,
+          lineHeight: 1.5,
+          color: 'var(--dsw-alias-label-tertiary)',
+        },
+        actionBar: {
+          border: '1px solid var(--dsw-alias-border-l2)',
+          borderRadius: 'var(--dsw-radius-sm)',
+          padding: '10px 14px',
+          background: 'var(--dsw-alias-card-fill)',
+          display: 'flex',
+          flexDirection: 'column',
+          gap: 8,
+        },
+        actionBarDirty: {
+          borderLeft: '3px solid var(--dsw-alias-state-warn-primary)',
+        },
+        actionRow: {
+          display: 'flex',
+          gap: 8,
+          alignItems: 'center',
+          flexWrap: 'wrap',
+        },
+        sectionCaption: {
+          fontSize: 11,
+          fontWeight: 600,
+          color: 'var(--dsw-alias-label-tertiary)',
+          paddingTop: 2,
+        },
+      }
+
+      const RECOMMENDED_DEFAULTS = {
+        developMode: 'standard',
+        childProvider: 'dsh-opencode-go',
+        childModel: 'deepseek-v4.1-flash',
+        childReasoningEffort: '',
+        modelGuardMode: 'pin',
+        killOnViolation: true,
+        honorExplicit: false,
+        audit: true,
+        guardAllSubagents: false,
+        mainToolMode: 'ask-edit',
+        mainStepWarnThreshold: 6,
       }
 
       const FIELD_LABELS = {
@@ -128,6 +230,8 @@ window.__ModuleLoader__.load({
         honorExplicit: ['尊重子代理自己选的模型', 'Honor an explicit child model'],
         audit: ['记录详细日志', 'Write detailed logs'],
         guardAllSubagents: ['同时管理其他插件的子代理', 'Also govern subagents from other plugins'],
+        mainToolMode: ['主窗工具权限', 'Main session tools'],
+        mainStepWarnThreshold: ['主窗连续步数提醒阈值', 'Main step warning threshold'],
       }
 
       function useActiveLocale(locale) {
@@ -148,50 +252,172 @@ window.__ModuleLoader__.load({
         return active
       }
 
+      const FAST_POLL_MS = 700
+      const IDLE_POLL_MS = 30000
+
+      const isStateConverged = (state) =>
+        Boolean(
+          state &&
+            state.registration !== 'pending' &&
+            state.registration !== 'switching' &&
+            state.modelCatalog &&
+            state.modelCatalog.checked === true &&
+            state.presets &&
+            state.presets.checked === true,
+        )
+
       function useHostState() {
         const [state, setState] = React.useState(null)
         const [error, setError] = React.useState(null)
         const stopped = React.useRef(false)
+        const mountedRef = React.useRef(true)
+        const stateRef = React.useRef(null)
+        const lastVersionRef = React.useRef(null)
+        const inFlightRef = React.useRef(null)
+        const pollTimerRef = React.useRef(null)
+        const scheduleNextRef = React.useRef(null)
 
         const load = React.useCallback(async (force = false) => {
           if (stopped.current && force !== true) return null
-          try {
-            const response = await fetch(API + '/state', { cache: 'no-store' })
-            if (response.status === 404) {
-              stopped.current = true
-              setError({ kind: 'not-found' })
-              return null
-            }
-            let json = null
+          if (inFlightRef.current) {
+            if (force !== true) return inFlightRef.current.promise
             try {
-              json = await response.json()
+              if (inFlightRef.current.controller) inFlightRef.current.controller.abort()
             } catch {
-              throw new Error('invalid JSON response')
+              /* ignore */
             }
-            if (!response.ok) {
-              setError({
-                kind: 'http',
-                status: response.status,
-                message: (json && (json.error || json.code)) || 'HTTP ' + response.status,
-              })
-              return null
-            }
-            stopped.current = false
-            setState(json)
-            setError(null)
-            return json
-          } catch (cause) {
-            setError({ kind: 'network', message: String((cause && cause.message) || cause) })
-            return null
           }
+
+          const controller = typeof AbortController === 'function' ? new AbortController() : null
+          const headers = {}
+          if (force !== true && lastVersionRef.current !== null && stateRef.current !== null) {
+            headers['if-none-match'] = '"' + String(lastVersionRef.current) + '"'
+          }
+
+          const request = (async () => {
+            try {
+              const response = await fetch(API + '/state', {
+                cache: 'no-store',
+                headers,
+                ...(controller ? { signal: controller.signal } : null),
+              })
+              if (!mountedRef.current) return null
+              if (response.status === 304) {
+                stopped.current = false
+                setError((prev) => (prev ? null : prev))
+                if (force === true && scheduleNextRef.current) scheduleNextRef.current()
+                return stateRef.current
+              }
+              if (response.status === 404) {
+                stopped.current = true
+                setError({ kind: 'not-found' })
+                return null
+              }
+              let json = null
+              try {
+                json = await response.json()
+              } catch {
+                throw new Error('invalid JSON response')
+              }
+              if (!mountedRef.current) return null
+              if (!response.ok) {
+                setError({
+                  kind: 'http',
+                  status: response.status,
+                  message: (json && (json.error || json.code)) || 'HTTP ' + response.status,
+                })
+                return null
+              }
+              stopped.current = false
+              const nextTag =
+                json && json.stateTag !== undefined
+                  ? json.stateTag
+                  : json && json.stateVersion !== undefined
+                    ? json.stateVersion
+                    : null
+              if (lastVersionRef.current !== null && nextTag !== null && nextTag === lastVersionRef.current) {
+                setError((prev) => (prev ? null : prev))
+                if (force === true && scheduleNextRef.current) scheduleNextRef.current()
+                return stateRef.current || json
+              }
+              lastVersionRef.current = nextTag
+              stateRef.current = json
+              setState(json)
+              setError((prev) => (prev ? null : prev))
+              if (force === true && scheduleNextRef.current) scheduleNextRef.current()
+              return json
+            } catch (cause) {
+              if (cause && cause.name === 'AbortError') return null
+              if (mountedRef.current) {
+                setError({ kind: 'network', message: String((cause && cause.message) || cause) })
+              }
+              return null
+            } finally {
+              if (inFlightRef.current && inFlightRef.current.controller === controller) {
+                inFlightRef.current = null
+              }
+            }
+          })()
+
+          inFlightRef.current = { controller, promise: request }
+          return request
         }, [])
 
         React.useEffect(() => {
-          load(true)
-          const timer = setInterval(() => {
-            if (!stopped.current) load(false)
-          }, 4000)
-          return () => clearInterval(timer)
+          mountedRef.current = true
+          const clearPoll = () => {
+            if (pollTimerRef.current !== null) {
+              clearTimeout(pollTimerRef.current)
+              pollTimerRef.current = null
+            }
+          }
+          const scheduleNext = () => {
+            clearPoll()
+            if (!mountedRef.current || stopped.current) return
+            const delay = isStateConverged(stateRef.current) ? IDLE_POLL_MS : FAST_POLL_MS
+            pollTimerRef.current = setTimeout(() => {
+              pollTimerRef.current = null
+              if (!mountedRef.current || stopped.current) return
+              if (typeof document !== 'undefined' && document.hidden === true) {
+                scheduleNext()
+                return
+              }
+              load(false).finally(() => {
+                if (mountedRef.current) scheduleNext()
+              })
+            }, delay)
+          }
+          scheduleNextRef.current = scheduleNext
+          const onVisibilityChange = () => {
+            if (typeof document !== 'undefined' && document.hidden === true) return
+            if (!mountedRef.current || stopped.current) return
+            clearPoll()
+            load(false).finally(() => {
+              if (mountedRef.current) scheduleNext()
+            })
+          }
+          if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
+            document.addEventListener('visibilitychange', onVisibilityChange)
+          }
+          load(true).finally(() => {
+            if (mountedRef.current) scheduleNext()
+          })
+          return () => {
+            mountedRef.current = false
+            scheduleNextRef.current = null
+            clearPoll()
+            if (typeof document !== 'undefined' && typeof document.removeEventListener === 'function') {
+              document.removeEventListener('visibilitychange', onVisibilityChange)
+            }
+            if (inFlightRef.current && inFlightRef.current.controller) {
+              try {
+                inFlightRef.current.controller.abort()
+              } catch {
+                /* ignore */
+              }
+            }
+            inFlightRef.current = null
+          }
         }, [load])
 
         return {
@@ -276,7 +502,14 @@ window.__ModuleLoader__.load({
         return entry && Array.isArray(entry.models) && entry.models[0] ? entry.models[0].model : ''
       }
 
-      const presetChoices = (rows, current, selfId, T) => {
+      const presetChoices = (rows, current, selfIds, T) => {
+        const disabledIds = new Set(
+          Array.isArray(selfIds)
+            ? selfIds
+            : typeof selfIds === 'string' && selfIds.length > 0
+              ? [selfIds]
+              : ['dev-plan', 'dev-plan-scout', 'dev-plan-scribe'],
+        )
         const choices = [
           {
             value: 'standard',
@@ -288,10 +521,10 @@ window.__ModuleLoader__.load({
           if (!row || typeof row.id !== 'string' || row.id.length === 0 || seen.has(row.id)) continue
           seen.add(row.id)
           const label = row.name && row.name !== row.id ? row.name + '（' + row.id + '）' : row.id
-          if (row.id === selfId) {
+          if (disabledIds.has(row.id)) {
             choices.push({
               value: row.id,
-              label: label + ' — ' + T('不能选自己', 'cannot use itself'),
+              label: label + ' — ' + T('内部预设，不能选自己', 'internal preset, cannot use itself'),
               disabled: true,
             })
           } else if (row.broken) {
@@ -373,8 +606,8 @@ window.__ModuleLoader__.load({
           'span',
           null,
           T(
-            '设置施工方式、子代理服务商与模型，以及模型守门的范围。',
-            'Choose the development setup, the subagent provider and model, and how far the model guard applies.',
+            '设置施工方式、主窗工具权限（默认 ask-edit）、子代理服务商与模型，以及模型守门范围。',
+            'Configure the development setup, main-session tool mode (default ask-edit), subagent provider/model, and model guard scope.',
           ),
         )
       }
@@ -388,10 +621,34 @@ window.__ModuleLoader__.load({
         const [dirty, setDirty] = React.useState(false)
         const [busy, setBusy] = React.useState(false)
         const [notice, setNotice] = React.useState(null)
+        const timersRef = React.useRef([])
+        const lastSyncedConfigJsonRef = React.useRef('')
+
+        React.useEffect(() => {
+          return () => {
+            for (const timerId of timersRef.current) clearTimeout(timerId)
+            timersRef.current = []
+          }
+        }, [])
+
+        const scheduleRefresh = React.useCallback(
+          (delayMs) => {
+            const timerId = setTimeout(() => {
+              timersRef.current = timersRef.current.filter((item) => item !== timerId)
+              refresh()
+            }, delayMs)
+            timersRef.current.push(timerId)
+          },
+          [refresh],
+        )
 
         const config = state && state.config ? state.config : null
         React.useEffect(() => {
-          if (config && !dirty) setDraft({ ...config })
+          if (!config || dirty) return
+          const nextJson = JSON.stringify(config)
+          if (nextJson === lastSyncedConfigJsonRef.current) return
+          lastSyncedConfigJsonRef.current = nextJson
+          setDraft({ ...config })
         }, [config, dirty])
 
         const update = (patch) => {
@@ -421,8 +678,10 @@ window.__ModuleLoader__.load({
               failure.hostFormatted = true
               throw failure
             }
+            const nextConfig = json && json.config ? json.config : draft
+            lastSyncedConfigJsonRef.current = JSON.stringify(nextConfig)
             setDirty(false)
-            setDraft(json && json.config ? json.config : draft)
+            setDraft(nextConfig)
             setNotice({
               kind: json && json.unchanged ? 'unchanged' : 'saved',
               text: json && json.unchanged
@@ -432,8 +691,8 @@ window.__ModuleLoader__.load({
                     'Saved and applying; existing sessions keep their current settings, while new sessions use the new ones.',
                   ),
             })
-            setTimeout(refresh, 600)
-            setTimeout(refresh, 1800)
+            scheduleRefresh(600)
+            scheduleRefresh(1800)
           } catch (cause) {
             // 保存会触发插件重建，连接可能短暂断开；重读一次若已是草稿值就按成功显示。
             let applied = false
@@ -447,6 +706,7 @@ window.__ModuleLoader__.load({
               applied = false
             }
             if (applied) {
+              lastSyncedConfigJsonRef.current = JSON.stringify(draft)
               setDirty(false)
               setNotice({
                 kind: 'saved',
@@ -471,10 +731,23 @@ window.__ModuleLoader__.load({
         const discardAndRefresh = () => {
           if (dirty) {
             setDirty(false)
+            lastSyncedConfigJsonRef.current = config ? JSON.stringify(config) : ''
             setDraft(config ? { ...config } : null)
             setNotice({ kind: 'discarded', text: T('已放弃未保存的修改。', 'Unsaved changes discarded.') })
           }
           refresh()
+        }
+
+        const resetToDefaults = () => {
+          setDirty(true)
+          setDraft({ ...RECOMMENDED_DEFAULTS })
+          setNotice({
+            kind: 'reset',
+            text: T(
+              '已恢复为推荐默认值（草稿），点“保存并应用”后生效。',
+              'Recommended defaults loaded into the draft; select Save & apply to take effect.',
+            ),
+          })
         }
 
         const mode = state ? state.effectiveMode : null
@@ -483,6 +756,11 @@ window.__ModuleLoader__.load({
         const presetsState = state && state.presets ? state.presets : null
         const presetRows = presetsState && Array.isArray(presetsState.rows) ? presetsState.rows : []
         const selfId = (presetsState && presetsState.selfId) || 'dev-plan'
+        const disabledIds =
+          presetsState && Array.isArray(presetsState.disabledIds)
+            ? presetsState.disabledIds
+            : [selfId, 'dev-plan-scout', 'dev-plan-scribe']
+        const internalPresets = state && state.internalPresets ? state.internalPresets : null
         const modelCatalog = state && state.modelCatalog ? state.modelCatalog : null
         const providers = modelCatalog && Array.isArray(modelCatalog.providers) ? modelCatalog.providers : []
         const catalogFailures = modelCatalog && Array.isArray(modelCatalog.failures) ? modelCatalog.failures : []
@@ -498,6 +776,20 @@ window.__ModuleLoader__.load({
         const providerKnown = providers.some((entry) => entry && entry.provider === providerId)
         const modelId = draft ? draft.childModel : route ? route.model : ''
         const modelKnown = models.some((entry) => entry && entry.model === modelId)
+
+        const draftDevelopMode = draft ? draft.developMode : ''
+        const memoPresetChoices = React.useMemo(
+          () => presetChoices(presetRows, draftDevelopMode, disabledIds, T),
+          [presetRows, draftDevelopMode, disabledIds, isZh],
+        )
+        const memoProviderChoices = React.useMemo(
+          () => providerChoices(providers, providerId, T),
+          [providers, providerId, isZh],
+        )
+        const memoModelChoices = React.useMemo(
+          () => modelChoices(models, modelId, T),
+          [models, modelId, isZh],
+        )
 
         const changeProvider = (nextProvider) => {
           const firstModel = firstModelOf(providers, nextProvider)
@@ -646,6 +938,43 @@ window.__ModuleLoader__.load({
                 )
               : ''
 
+        const activeMainToolMode =
+          draft && draft.mainToolMode
+            ? draft.mainToolMode
+            : config && config.mainToolMode
+              ? config.mainToolMode
+              : 'ask-edit'
+        const effectiveMainToolMode = config && config.mainToolMode ? config.mainToolMode : 'ask-edit'
+        const mainToolModeCards = [
+          {
+            value: 'ask-edit',
+            title: 'ask-edit',
+            badge: T('默认推荐', 'Default'),
+            desc: T(
+              '允许小范围只读核验（read/glob/grep ≤ 3 文件）；任何 write/edit 必须先获你当轮明确同意且限局部微改（≤ 2 文件 / ≤ 50 行）；永不挂 Shell。',
+              'Allows small read-only checks (read/glob/grep ≤ 3 files) and local edits (≤ 2 files / ≤ 50 lines) only after your explicit approval in that turn; never mounts Shell.',
+            ),
+          },
+          {
+            value: 'readonly',
+            title: 'readonly',
+            badge: T('仅检索', 'Read-only'),
+            desc: T(
+              '仅开放小范围只读检索（glob/grep）用于快速定位文件或符号，完全不能改文件或跑命令；大仓库遍历与全部修改仍交子代理。',
+              'Opens small read-only search (glob/grep) for quick file or symbol lookup; cannot edit files or run commands. Full scans and edits stay with subagents.',
+            ),
+          },
+          {
+            value: 'none',
+            title: 'none',
+            badge: T('最省额度', 'Lowest quota'),
+            desc: T(
+              '主窗零实操工具，只做规划、派工与复核；全部读写、检索、文档与施工均交给便宜模型子代理，最省昂贵主模型额度。',
+              'No direct tools in the main window — planning, delegation, and review only. All reads, searches, edits, and commands run on cheaper subagents.',
+            ),
+          },
+        ]
+
         return h(
           'div',
           { style: styles.root },
@@ -655,16 +984,60 @@ window.__ModuleLoader__.load({
             { style: styles.head },
             h('span', { style: styles.dot(phase) }),
             h('span', { style: styles.title }, T('开发规划与交付 · 施工设置', 'Development planning & delivery · development settings')),
+            state && state.version ? h('span', { style: styles.badge }, 'v' + String(state.version)) : null,
             h('span', { style: styles.status, role: 'status', 'aria-live': 'polite' }, statusText),
           ),
           h(
             'div',
             { style: styles.hint },
             T(
-              '主窗口只做规划、派工与复核，永不亲自写代码；develop 子代理负责施工并直接向主窗口汇报。',
-              'The main window only plans, dispatches, and reviews; it never writes code. The develop subagent implements and reports back directly.',
+              '主窗口负责规划、派工、复核与受控微实操（永不跑 Shell）；实际施工、测试与大范围查证由便宜模型子代理完成并直接汇报。',
+              'The main window handles planning, delegation, review, and controlled micro-actions (never Shell); full implementation, tests, and broad inspection run on cheaper subagents.',
             ),
           ),
+
+          state
+            ? h(
+                'div',
+                { style: styles.summaryBar },
+                h(
+                  'div',
+                  { style: styles.summaryItem },
+                  h('span', { style: styles.summaryKey }, T('施工方式', 'Setup')),
+                  h('span', { style: styles.mono }, modeName || mode || 'standard'),
+                ),
+                h(
+                  'div',
+                  { style: styles.summaryItem },
+                  h('span', { style: styles.summaryKey }, T('主窗权限', 'Main tools')),
+                  h('span', { style: styles.mono }, effectiveMainToolMode),
+                ),
+                route
+                  ? h(
+                      'div',
+                      { style: styles.summaryItem },
+                      h('span', { style: styles.summaryKey }, T('子代理模型', 'Subagent')),
+                      h(
+                        'span',
+                        { style: styles.mono },
+                        route.provider + '/' + route.model + (route.reasoningEffort ? '/' + route.reasoningEffort : ''),
+                      ),
+                    )
+                  : null,
+                config
+                  ? h(
+                      'div',
+                      { style: styles.summaryItem },
+                      h('span', { style: styles.summaryKey }, T('模型守门', 'Guard')),
+                      h(
+                        'span',
+                        { style: styles.mono },
+                        config.modelGuardMode + (config.guardAllSubagents ? ' · all' : ' · dev-plan'),
+                      ),
+                    )
+                  : null,
+              )
+            : null,
 
           readErrorText
             ? h(
@@ -707,10 +1080,15 @@ window.__ModuleLoader__.load({
             ? h(
                 'div',
                 { style: styles.hint },
-                T(
-                  '只有 develop 使用“' + (modeName || mode) + '”；recon / review / scribe 仍为 standard。',
-                  'Only develop uses “' + (modeName || mode) + '”; recon / review / scribe stay on standard.',
-                ),
+                internalPresets && internalPresets.scout && internalPresets.scribe
+                  ? T(
+                      '只有 develop 使用“' + (modeName || mode) + '”；recon / review 使用轻量只读子预设，scribe 使用轻量文书子预设。',
+                      'Only develop uses “' + (modeName || mode) + '”; recon / review use the lightweight read-only preset, and scribe uses the lightweight scribe preset.',
+                    )
+                  : T(
+                      '只有 develop 使用“' + (modeName || mode) + '”；recon / review / scribe 仍为 standard。',
+                      'Only develop uses “' + (modeName || mode) + '”; recon / review / scribe stay on standard.',
+                    ),
               )
             : null,
 
@@ -739,7 +1117,7 @@ window.__ModuleLoader__.load({
                         disabled: busy,
                         onChange: (event) => update({ developMode: event.target.value }),
                       },
-                      renderChoices(presetChoices(presetRows, draft.developMode, selfId, T)),
+                      renderChoices(memoPresetChoices),
                     ),
                   ),
                   presetCatalogText
@@ -767,7 +1145,7 @@ window.__ModuleLoader__.load({
                           disabled: busy || providers.length === 0,
                           onChange: (event) => changeProvider(event.target.value),
                         },
-                        renderChoices(providerChoices(providers, providerId, T)),
+                        renderChoices(memoProviderChoices),
                       ),
                     ),
                     h(
@@ -786,7 +1164,7 @@ window.__ModuleLoader__.load({
                           disabled: busy || models.length === 0,
                           onChange: (event) => update({ childModel: event.target.value }),
                         },
-                        renderChoices(modelChoices(models, modelId, T)),
+                        renderChoices(memoModelChoices),
                       ),
                     ),
                   ),
@@ -840,7 +1218,134 @@ window.__ModuleLoader__.load({
           h(
             'fieldset',
             { style: { ...styles.card, margin: 0, minWidth: 0 } },
-            h('legend', { style: styles.legend }, T('模型守门', 'Model guard')),
+            h('legend', { style: styles.legend }, T('主窗工具权限与额度提醒', 'Main session tool permissions & quota reminder')),
+            h(
+              'div',
+              { style: styles.hint },
+              T(
+                '控制昂贵主模型在主窗可直接使用的工具范围；Shell、测试与大改动始终留给便宜模型的 develop 子代理。',
+                'Controls what tools the expensive main model may use directly; Shell, tests, and larger edits always stay with the develop subagent.',
+              ),
+            ),
+            draft
+              ? h(
+                  React.Fragment,
+                  null,
+                  h(
+                    'div',
+                    { style: styles.modeGrid },
+                    mainToolModeCards.map((item) => {
+                      const selected = activeMainToolMode === item.value
+                      return h(
+                        'button',
+                        {
+                          key: item.value,
+                          type: 'button',
+                          disabled: busy,
+                          'aria-pressed': selected,
+                          title: T('点击切换到 ', 'Select mode: ') + item.value,
+                          style: {
+                            ...styles.modeCard,
+                            ...(selected ? styles.modeCardActive : null),
+                            ...(busy ? styles.buttonDisabled : null),
+                          },
+                          onClick: () => update({ mainToolMode: item.value }),
+                        },
+                        h(
+                          'div',
+                          { style: styles.modeCardHead },
+                          h('span', { style: styles.mono }, item.title),
+                          h(
+                            'span',
+                            { style: styles.badge },
+                            selected ? T('当前 · ', 'Active · ') + item.badge : item.badge,
+                          ),
+                        ),
+                        h('div', { style: styles.modeCardDesc }, item.desc),
+                      )
+                    }),
+                  ),
+                  h(
+                    'div',
+                    { style: styles.row },
+                    h(
+                      Field,
+                      {
+                        id: 'dev-plan-presets-main-tool-mode',
+                        label: T('主窗工具权限', 'Main session tools'),
+                        hint: T(
+                          '默认 ask-edit（上方三张卡片可直接点击切换）；保存后对新建会话生效。',
+                          'Defaults to ask-edit (you can also select any mode card above); applies to new sessions after saving.',
+                        ),
+                      },
+                      h(
+                        'select',
+                        {
+                          name: 'mainToolMode',
+                          style: { ...styles.control, ...(busy ? styles.controlDisabled : null) },
+                          value: draft.mainToolMode || 'ask-edit',
+                          disabled: busy,
+                          onChange: (event) => update({ mainToolMode: event.target.value }),
+                        },
+                        h(
+                          'option',
+                          { value: 'ask-edit' },
+                          'ask-edit — ' + T('授权微实操（默认推荐：小范围只读 + 同意后微改，无 Shell）', 'Approved micro-edits (default: small read-only + approved edits, no Shell)'),
+                        ),
+                        h(
+                          'option',
+                          { value: 'readonly' },
+                          'readonly — ' + T('仅只读检索（小范围 glob/grep，不可改文件）', 'Read-only search (small glob/grep, no edits)'),
+                        ),
+                        h(
+                          'option',
+                          { value: 'none' },
+                          'none — ' + T('纯规划派工（零实操工具，最省主模型额度）', 'Plan & delegate only (no direct tools, lowest main quota)'),
+                        ),
+                      ),
+                    ),
+                    h(
+                      Field,
+                      {
+                        id: 'dev-plan-presets-main-step-warn',
+                        label: T('主窗连续步数提醒阈值（2–30 步）', 'Main step warning threshold (2–30)'),
+                        hint: T(
+                          '仅在非 none 模式下生效；超过阈值仅提示转交子代理，绝不强制中断或改换主模型。',
+                          'Active when mode is not none; exceeding this threshold only suggests handing off to a subagent and never interrupts or changes the main model.',
+                        ),
+                      },
+                      h('input', {
+                        type: 'number',
+                        name: 'mainStepWarnThreshold',
+                        min: 2,
+                        max: 30,
+                        step: 1,
+                        style: {
+                          ...styles.control,
+                          ...(busy || (draft.mainToolMode || 'ask-edit') === 'none' ? styles.controlDisabled : null),
+                        },
+                        value: draft.mainStepWarnThreshold === undefined ? 6 : draft.mainStepWarnThreshold,
+                        disabled: busy || (draft.mainToolMode || 'ask-edit') === 'none',
+                        onChange: (event) => {
+                          const raw = String(event.target.value || '').trim()
+                          if (raw === '') {
+                            update({ mainStepWarnThreshold: '' })
+                            return
+                          }
+                          const num = Number(raw)
+                          update({ mainStepWarnThreshold: Number.isFinite(num) ? num : raw })
+                        },
+                      }),
+                    ),
+                  ),
+                )
+              : h('div', { style: styles.hint }, T('加载中…', 'Loading…')),
+          ),
+
+          h(
+            'fieldset',
+            { style: { ...styles.card, margin: 0, minWidth: 0 } },
+            h('legend', { style: styles.legend }, T('子代理模型守门', 'Subagent model guard')),
             h(
               'div',
               { style: styles.hint },
@@ -855,6 +1360,7 @@ window.__ModuleLoader__.load({
                     {
                       id: 'dev-plan-presets-guard-mode',
                       label: T('守门方式', 'Guard behavior'),
+                      hint: guardHint,
                     },
                     h(
                       'select',
@@ -870,7 +1376,6 @@ window.__ModuleLoader__.load({
                       h('option', { value: 'off' }, 'off — ' + T('不管理模型', 'no model management')),
                     ),
                   ),
-                  h('div', { style: styles.hint }, guardHint),
                   h(
                     'div',
                     { style: styles.row },
@@ -901,8 +1406,9 @@ window.__ModuleLoader__.load({
                     { style: styles.row },
                     h(
                       'label',
-                      { style: styles.check },
+                      { style: styles.check, htmlFor: 'dev-plan-presets-kill-violation' },
                       h('input', {
+                        id: 'dev-plan-presets-kill-violation',
                         type: 'checkbox',
                         name: 'killOnViolation',
                         checked: Boolean(draft.killOnViolation),
@@ -913,8 +1419,9 @@ window.__ModuleLoader__.load({
                     ),
                     h(
                       'label',
-                      { style: styles.check },
+                      { style: styles.check, htmlFor: 'dev-plan-presets-honor-explicit' },
                       h('input', {
+                        id: 'dev-plan-presets-honor-explicit',
                         type: 'checkbox',
                         name: 'honorExplicit',
                         checked: Boolean(draft.honorExplicit),
@@ -925,8 +1432,9 @@ window.__ModuleLoader__.load({
                     ),
                     h(
                       'label',
-                      { style: styles.check },
+                      { style: styles.check, htmlFor: 'dev-plan-presets-audit' },
                       h('input', {
+                        id: 'dev-plan-presets-audit',
                         type: 'checkbox',
                         name: 'audit',
                         checked: Boolean(draft.audit),
@@ -950,41 +1458,64 @@ window.__ModuleLoader__.load({
 
           h(
             'div',
-            { style: styles.row },
+            { style: { ...styles.actionBar, ...(dirty ? styles.actionBarDirty : null) } },
             h(
-              'button',
-              {
-                type: 'button',
-                style: {
-                  ...styles.primary,
-                  ...(busy || !draft || !dirty ? styles.buttonDisabled : null),
+              'div',
+              { style: styles.actionRow },
+              h(
+                'button',
+                {
+                  type: 'button',
+                  style: {
+                    ...styles.primary,
+                    ...(busy || !draft || !dirty ? styles.buttonDisabled : null),
+                  },
+                  disabled: busy || !draft || !dirty,
+                  'aria-busy': busy,
+                  'aria-disabled': busy || !draft || !dirty,
+                  title: !dirty
+                    ? T('当前没有未保存的修改', 'No unsaved changes')
+                    : T('写入配置并重载插件，新会话生效', 'Save configuration and reload the plugin for new sessions'),
+                  onClick: save,
                 },
-                disabled: busy || !draft || !dirty,
-                'aria-busy': busy,
-                'aria-disabled': busy || !draft || !dirty,
-                title: !dirty ? T('没有未保存的修改', 'No unsaved changes') : undefined,
-                onClick: save,
-              },
-              busy ? T('保存中…', 'Saving…') : T('保存', 'Save'),
-            ),
-            h(
-              'button',
-              {
-                type: 'button',
-                style: { ...styles.button, ...(busy ? styles.buttonDisabled : null) },
-                disabled: busy,
-                onClick: discardAndRefresh,
-              },
-              dirty ? T('放弃修改并刷新', 'Discard changes and refresh') : T('刷新', 'Refresh'),
-            ),
-            h(
-              'span',
-              { style: styles.status, role: 'status', 'aria-live': 'polite' },
-              saveStateText,
+                busy ? T('保存中…', 'Saving…') : T('保存并应用', 'Save & apply'),
+              ),
+              h(
+                'button',
+                {
+                  type: 'button',
+                  style: { ...styles.button, ...(busy ? styles.buttonDisabled : null) },
+                  disabled: busy,
+                  title: dirty
+                    ? T('放弃未保存草稿，重新从 Host 读取已生效配置', 'Discard unsaved draft and reload the active config from Host')
+                    : T('立即重新拉取预设目录、模型目录与最新运行状态', 'Reload presets, model catalog, and runtime state from Host'),
+                  onClick: discardAndRefresh,
+                },
+                dirty ? T('放弃修改并刷新', 'Discard changes and refresh') : T('刷新状态', 'Refresh state'),
+              ),
+              h(
+                'button',
+                {
+                  type: 'button',
+                  style: { ...styles.button, ...(busy || !draft ? styles.buttonDisabled : null) },
+                  disabled: busy || !draft,
+                  title: T(
+                    '将表单填回推荐默认值（standard + ask-edit + pin），需点“保存并应用”才会落盘',
+                    'Fill recommended defaults (standard + ask-edit + pin) into the draft; select Save & apply to persist',
+                  ),
+                  onClick: resetToDefaults,
+                },
+                T('恢复默认', 'Reset defaults'),
+              ),
+              h(
+                'span',
+                { style: styles.badge, role: 'status', 'aria-live': 'polite' },
+                saveStateText,
+              ),
             ),
             notice
               ? h(
-                  'span',
+                  'div',
                   {
                     style: notice.kind === 'error' ? styles.noticeError : styles.noticeOk,
                     role: notice.kind === 'error' ? 'alert' : 'status',
@@ -993,16 +1524,17 @@ window.__ModuleLoader__.load({
                   notice.text,
                 )
               : null,
-          ),
-
-          h(
-            'div',
-            { style: styles.hint },
-            T(
-              '保存后插件会重新加载；现有会话继续使用当前设置，新建会话才会使用新设置。',
-              'Saving reloads the plugin; existing sessions keep their current settings, and new sessions use the new ones.',
+            h(
+              'div',
+              { style: styles.hint },
+              T(
+                '按键说明：保存并应用 = 落盘并重载插件（现有会话保持旧设置，新建会话生效）；刷新状态 = 拉取最新预设与模型目录；恢复默认 = 仅填回推荐草稿，保存前不会修改配置。',
+                'Buttons: Save & apply writes settings and reloads the plugin (new sessions use new settings); Refresh state reloads host catalogs; Reset defaults fills recommended values into the draft without saving yet.',
+              ),
             ),
           ),
+
+          h('div', { style: styles.sectionCaption }, T('运行状态与诊断', 'Runtime status & diagnostics')),
 
           preset
             ? h(
@@ -1081,7 +1613,13 @@ window.__ModuleLoader__.load({
       }
       // 仅测试开关打开时暴露纯选择函数；生产模块对象不变。
       if (globalThis.__DSH_DEV_PLAN_PRESETS_TEST__ === true) {
-        exportedModule.__test = { presetChoices, providerChoices, modelChoices, firstModelOf }
+        exportedModule.__test = {
+          presetChoices,
+          providerChoices,
+          modelChoices,
+          firstModelOf,
+          isStateConverged,
+        }
       }
       return exportedModule
     } catch (error) {

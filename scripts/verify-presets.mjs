@@ -80,25 +80,6 @@ const findTool = (definition, toolName) =>
     (row) => row?.name === '@deepseek-ai/dsh-tool-subagent' && row?.config?.toolName === toolName,
   )
 
-const extractTemplate = (text, name) => {
-  if (typeof text !== 'string') return null
-  const expression = new RegExp(
-    `^[ \\t]*=+ ROLE-TEMPLATE:${name}:BEGIN =+[ \\t]*\\r?\\n([\\s\\S]*?)^[ \\t]*=+ ROLE-TEMPLATE:${name}:END =+[ \\t]*$`,
-    'm',
-  )
-  const match = expression.exec(text)
-  return match ? match[1] : null
-}
-
-const numberedRules = (text) => {
-  const rules = new Map()
-  for (const line of String(text ?? '').split(/\r?\n/)) {
-    const match = /^\s*(\d+)\.\s+(.+?)\s*$/.exec(line)
-    if (match) rules.set(Number(match[1]), match[2])
-  }
-  return rules
-}
-
 const globCovers = (pattern, rel) => {
   if (!pattern.includes('*')) {
     const directory = pattern.replace(/\/+$/, '')
@@ -142,14 +123,64 @@ export async function loadSurface() {
     presets: [{ id: 'dev-plan', name: '开发规划与交付' }],
     catalogChecked: true,
   })
-  const standard = modules.preset.buildPresetDefinition({ settings: base, mode: standardMode })
-  const fallback = modules.preset.buildPresetDefinition({ settings: base, mode: fallbackMode })
-  const deepPtc = modules.preset.buildPresetDefinition({ settings: base, mode: deepPtcMode })
-  const custom = modules.preset.buildPresetDefinition({ settings: base, mode: customMode })
+  const scoutSelfMode = modules.preset.resolveDevelopMode({
+    requestedMode: 'dev-plan-scout',
+    presets: [{ id: 'dev-plan-scout' }],
+    catalogChecked: true,
+  })
+  const scribeSelfMode = modules.preset.resolveDevelopMode({
+    requestedMode: 'dev-plan-scribe',
+    presets: [{ id: 'dev-plan-scribe' }],
+    catalogChecked: true,
+  })
+  const internalActive = { scout: false, scribe: false }
+  const standard = modules.preset.buildPresetDefinition({
+    settings: base,
+    mode: standardMode,
+    internalPresets: internalActive,
+  })
+  const standardFallbackSub = modules.preset.buildPresetDefinition({
+    settings: base,
+    mode: standardMode,
+    internalPresets: { scout: false, scribe: false },
+  })
+  const noneMode = modules.preset.buildPresetDefinition({
+    settings: { ...base, mainToolMode: 'none' },
+    mode: standardMode,
+    internalPresets: internalActive,
+  })
+  const readonlyMode = modules.preset.buildPresetDefinition({
+    settings: { ...base, mainToolMode: 'readonly' },
+    mode: standardMode,
+    internalPresets: internalActive,
+  })
+  const askEditMode = modules.preset.buildPresetDefinition({
+    settings: { ...base, mainToolMode: 'ask-edit' },
+    mode: standardMode,
+    internalPresets: internalActive,
+  })
+  const fallback = modules.preset.buildPresetDefinition({
+    settings: base,
+    mode: fallbackMode,
+    internalPresets: internalActive,
+  })
+  const deepPtc = modules.preset.buildPresetDefinition({
+    settings: base,
+    mode: deepPtcMode,
+    internalPresets: internalActive,
+  })
+  const custom = modules.preset.buildPresetDefinition({
+    settings: base,
+    mode: customMode,
+    internalPresets: internalActive,
+  })
   const withEffort = modules.preset.buildPresetDefinition({
     settings: { ...base, childReasoningEffort: 'high' },
     mode: standardMode,
+    internalPresets: internalActive,
   })
+  const scoutPreset = modules.preset.buildScoutPresetDefinition()
+  const scribePreset = modules.preset.buildScribePresetDefinition()
   return {
     root: ROOT,
     pkg: pkgRead.value,
@@ -163,13 +194,23 @@ export async function loadSurface() {
     files,
     modules,
     standard,
+    standardFallbackSub,
+    noneMode,
+    readonlyMode,
+    askEditMode,
+    scoutPreset,
+    scribePreset,
     fallback,
     deepPtc,
     custom,
     selfFallback: selfMode,
+    scoutSelfFallback: scoutSelfMode,
+    scribeSelfFallback: scribeSelfMode,
     withEffort,
     constants: {
       presetId: modules.preset.PRESET_ID,
+      scoutPresetId: modules.preset.SCOUT_PRESET_ID,
+      scribePresetId: modules.preset.SCRIBE_PRESET_ID,
       presetName: modules.preset.PRESET_NAME,
       order: modules.preset.PRESET_ORDER,
       deepPtcId: modules.preset.DEEP_PTC_PRESET_ID,
@@ -181,12 +222,30 @@ export async function loadSurface() {
 export function checksFor(surface) {
   const results = []
   const check = (ok, label, detail = '') => results.push({ ok: Boolean(ok), label, detail: String(detail) })
-  const { pkg, pkgError, files, standard, fallback, deepPtc, custom, withEffort, readme, detail, locale } = surface
+  const {
+    pkg,
+    pkgError,
+    files,
+    standard,
+    standardFallbackSub,
+    noneMode,
+    readonlyMode,
+    askEditMode,
+    scoutPreset,
+    scribePreset,
+    fallback,
+    deepPtc,
+    custom,
+    withEffort,
+    readme,
+    detail,
+    locale,
+  } = surface
 
   // ── 打包层 ────────────────────────────────────────────────────────────────
   check(pkgError === null, 'package.json 是合法 JSON', pkgError ?? '')
   check(pkg?.name === 'dsh-dev-plan-presets', 'package.json name', pkg?.name)
-  check(pkg?.version === '0.3.0', 'package.json version=0.3.0', pkg?.version)
+  check(pkg?.version === '0.4.0', 'package.json version=0.4.0', pkg?.version)
   check(pkg?.type === 'module', 'package.json type=module')
   check(pkg?.private === false, 'package.json private=false（可开源发布）', String(pkg?.private))
   check(pkg?.license === 'MIT', 'package.json license=MIT', pkg?.license)
@@ -246,6 +305,8 @@ export function checksFor(surface) {
   check(/developMode:\s*standard/.test(patchText), '根补丁默认 developMode=standard')
   check(/modelGuardMode:\s*pin/.test(patchText), '根补丁默认 modelGuardMode=pin')
   check(/guardAllSubagents:\s*false/.test(patchText), '根补丁默认 guardAllSubagents=false')
+  check(/mainToolMode:\s*ask-edit/.test(patchText), '根补丁默认 mainToolMode=ask-edit')
+  check(/mainStepWarnThreshold:\s*6/.test(patchText), '根补丁默认 mainStepWarnThreshold=6')
   check(/childProvider:\s*dsh-opencode-go/.test(patchText), '根补丁默认 provider=dsh-opencode-go')
   check(/childModel:\s*deepseek-v4\.1-flash/.test(patchText), '根补丁默认 model=deepseek-v4.1-flash')
 
@@ -266,7 +327,10 @@ export function checksFor(surface) {
   }
   check(/ctx\.inject\(\['agentPresets'\]/.test(indexSource), 'index.js 通过 ctx.inject 等待 agentPresets')
   check(/registry\.register\(definition\)/.test(indexSource), 'index.js 真的调用 agentPresets.register')
-  check(/await unregister\(\)/.test(indexSource) && /child\.effect/.test(indexSource), '动态 preset disposer 交还给 ctx.effect')
+  check(/releaseAll/.test(indexSource) && /child\.effect/.test(indexSource), '动态 preset disposer 交还给 ctx.effect')
+  check(/stateVersion/.test(indexSource) && /bumpState/.test(indexSource) && /etag/i.test(indexSource) && /304/.test(indexSource), 'index.js 支持 stateVersion + ETag 304')
+  check(/state\.mode\?\.fallback === true \|\| state\.presets\.checked !== true/.test(indexSource), 'index.js scheduleVerification 跳过已命中目标时的冗余二次全量探测')
+  check(/prewarmModelCatalog/.test(indexSource) && /installMainStepBudget/.test(indexSource), 'index.js 包含模型目录空闲预热与主窗步数软提醒')
   check(/agent\/created/.test(guardSource), '模型守门监听 agent/created')
   check(/agent\/pre-step/.test(guardSource), '模型守门监听 agent/pre-step')
   check(/kind:\s*'reject'/.test(guardSource), '模型守门越界返回 reject')
@@ -274,6 +338,8 @@ export function checksFor(surface) {
   check(/parent\?\.inject|parent\.inject/.test(guardSource), '模型守门通知父会话')
   check(/parentSession/.test(guardSource) && /origin === 'subagent'/.test(guardSource), '模型守门只认子代理 header')
   check(/agent\/disposed/.test(guardSource), '模型守门监听 agent/disposed 清理 step guard')
+  check(/installMainStepBudget/.test(guardSource) && /mainToolMode/.test(guardSource), 'guard.js 提供主窗步数预算软提醒（永不 select/cancel）')
+  check(/onDispose/.test(guardSource) && /if \(stopped\) return \{ kind: 'reject' \}/.test(guardSource), 'guard.js 支持 effect 同步清理 steps 与 stopped 前置短路')
   check(
     /guardAllSubagents !== true/.test(guardSource) && /presetForSession/.test(guardSource),
     'guard 默认按父会话 dev-plan 限制，并优先用 presetForSession',
@@ -320,9 +386,12 @@ export function checksFor(surface) {
   check(/fetch\(API \+ '\/state'/.test(clientSource), 'client 读取 Host state 路由')
   check(/fetch\(API \+ '\/config'/.test(clientSource) && /method:\s*'POST'/.test(clientSource), 'client 通过 Host 路由保存配置')
   check(!/subagent-model-pin/.test(clientSource), 'client 不复用旧插件 id/路由')
-  for (const marker of ['developMode', 'childProvider', 'childModel', 'childReasoningEffort', 'modelGuardMode', 'killOnViolation', 'honorExplicit', 'audit', 'guardAllSubagents']) {
+  for (const marker of ['developMode', 'childProvider', 'childModel', 'childReasoningEffort', 'modelGuardMode', 'killOnViolation', 'honorExplicit', 'audit', 'guardAllSubagents', 'mainToolMode', 'mainStepWarnThreshold']) {
     check(clientSource.includes(marker), `client 设置页包含字段 ${marker}`)
   }
+  check(/if-none-match/.test(clientSource) && /304/.test(clientSource) && /stateVersion/.test(clientSource), 'client 支持 ETag/304 与 stateVersion 跳过重渲染')
+  check(/FAST_POLL_MS = 700/.test(clientSource) && /IDLE_POLL_MS = 30000/.test(clientSource) && /visibilitychange/.test(clientSource) && !/setInterval\(/.test(clientSource), 'client 使用自适应轮询与不可见暂停')
+  check(/React\.useMemo/.test(clientSource) && /timersRef/.test(clientSource) && /AbortController/.test(clientSource), 'client 使用 useMemo 与定时器/请求清理')
   check(/state.presets/.test(clientSource) && /presetRows/.test(clientSource), 'client 从 /state 动态列出预设')
   check(!/value: *'deep-ptc'/.test(clientSource), 'client 不再硬编码 deep-ptc 选项')
   check(
@@ -392,7 +461,7 @@ export function checksFor(surface) {
   check(/放弃修改并刷新/.test(clientSource), 'client dirty 时刷新明确标记为放弃修改')
   check(/设置路由未注册/.test(clientSource) && /settings route is not registered/i.test(clientSource), 'client 404 给出可执行指引')
   check(/stopped\.current/.test(clientSource), 'client 连续 404 停止自动轮询')
-  check(/setTimeout\(refresh, 600\)/.test(clientSource) && /setTimeout\(refresh, 1800\)/.test(clientSource), 'client 保存后可在 HMR 404 后重试回读')
+  check(/scheduleRefresh\(600\)/.test(clientSource) && /scheduleRefresh\(1800\)/.test(clientSource), 'client 保存后可在 HMR 404 后重试回读')
   check(/registration === 'pending'/.test(clientSource) && /registration === 'failed'/.test(clientSource) && /registration === 'switching'/.test(clientSource), 'client 显示 pending/failed/switching 状态')
   check(/施工方式/.test(clientSource) && /守门方式/.test(clientSource), 'client 两个模式 label 已区分')
   check(/只记录，不阻止/.test(clientSource) && /记录详细日志/.test(clientSource), 'client 区分守门 audit 与审计日志开关')
@@ -410,8 +479,25 @@ export function checksFor(surface) {
   check(typeof standard?.description === 'string' && standard.description.length > 0, 'preset 有动态 description')
   check(/standard/.test(standard?.description ?? ''), '默认 description 写明 standard')
 
+  const noneModeRows = flattenPlugins(noneMode?.plugins)
   for (const forbidden of surface.modules.preset.FORBIDDEN_MAIN_PLUGINS) {
-    check(!standardRows.some((row) => row?.name === forbidden), `主窗不挂载 ${forbidden}`)
+    check(!noneModeRows.some((row) => row?.name === forbidden), `主窗(none)不挂载 ${forbidden}`)
+  }
+  for (const neverMain of [
+    '@deepseek-ai/dsh-tool-bash',
+    '@deepseek-ai/dsh-tool-pwsh',
+    '@deepseek-ai/dsh-tool-workflow',
+    '@deepseek-ai/dsh-tool-jobs',
+    '@deepseek-ai/dsh-tool-schedule',
+    '@deepseek-ai/dsh-tool-goal',
+    '@deepseek-ai/dsh-tool-skill',
+    '@deepseek-ai/dsh-tool-todo',
+    '@deepseek-ai/dsh-tool-present',
+    '@deepseek-ai/dsh-tool-subagent-fork',
+    '@deepseek-ai/dsh-skill-filesystem',
+    '@deepseek-ai/dsh-plan-mode',
+  ]) {
+    check(!standardRows.some((row) => row?.name === neverMain), `主窗默认(ask-edit)不挂载 ${neverMain}`)
   }
   for (const required of [
     '@deepseek-ai/dsh-persona',
@@ -435,8 +521,70 @@ export function checksFor(surface) {
   for (const name of ['recon', 'review', 'scribe']) {
     check(
       toolRows.find((row) => row?.config?.toolName === name)?.config?.agentPreset === 'standard',
-      `${name} 继续使用 standard`,
+      `${name} 使用 standard（避免在预设下拉暴露额外选项）`,
     )
+  }
+
+  // ── mainToolMode 三档与内部轻量子预设插件面 ─────────────────────────────
+  const forbiddenSubagentPkgs = [
+    '@deepseek-ai/dsh-tool-bash',
+    '@deepseek-ai/dsh-tool-pwsh',
+    '@deepseek-ai/dsh-tool-workflow',
+    '@deepseek-ai/dsh-tool-jobs',
+    '@deepseek-ai/dsh-tool-schedule',
+    '@deepseek-ai/dsh-tool-goal',
+    '@deepseek-ai/dsh-tool-skill',
+    '@deepseek-ai/dsh-tool-todo',
+    '@deepseek-ai/dsh-tool-subagent',
+    '@deepseek-ai/dsh-plan-mode',
+  ]
+  const scoutRows = flattenPlugins(scoutPreset?.plugins)
+  const scribeRows = flattenPlugins(scribePreset?.plugins)
+  for (const pkgName of forbiddenSubagentPkgs) {
+    check(!scoutRows.some((r) => r?.name === pkgName), `dev-plan-scout 不含 ${pkgName}`)
+    check(!scribeRows.some((r) => r?.name === pkgName), `dev-plan-scribe 不含 ${pkgName}`)
+  }
+  check(
+    scoutRows.find((r) => r?.name === '@deepseek-ai/dsh-tool-fs')?.config?.applyPatch === false &&
+      scoutRows.find((r) => r?.name === '@deepseek-ai/dsh-tool-fs-search')?.config?.sampleOverCapGlobResults === false &&
+      scoutRows.find((r) => r?.name === '@deepseek-ai/dsh-tool-web')?.config?.fetch === true,
+    'dev-plan-scout 仅挂载只读 fs/search/web 且带宿主必需配置',
+  )
+  const scribeCompaction = (scribePreset?.plugins ?? []).find((r) => r?.id === 'compaction')
+  check(
+    scribeCompaction?.group === true &&
+      scribeCompaction?.isolate?.compaction === true &&
+      scribeRows.find((r) => r?.name === '@deepseek-ai/dsh-tool-fs')?.config?.applyPatch === false &&
+      !scribeRows.some((r) => r?.name === '@deepseek-ai/dsh-tool-fs-search') &&
+      !scribeRows.some((r) => r?.name === '@deepseek-ai/dsh-tool-web'),
+    'dev-plan-scribe 仅挂载 tool-fs 且 compaction 带 isolate 隔离组',
+  )
+
+  const readonlyRows = flattenPlugins(readonlyMode?.plugins)
+  const askEditRows = flattenPlugins(askEditMode?.plugins)
+  check(
+    readonlyRows.find((r) => r?.name === '@deepseek-ai/dsh-tool-fs-search')?.config?.sampleOverCapGlobResults === false &&
+      !readonlyRows.some((r) => r?.name === '@deepseek-ai/dsh-tool-fs'),
+    'mainToolMode=readonly 仅新增带有效配置的 tool-fs-search，不含 tool-fs',
+  )
+  check(
+    askEditRows.find((r) => r?.name === '@deepseek-ai/dsh-tool-fs')?.config?.applyPatch === false &&
+      askEditRows.find((r) => r?.name === '@deepseek-ai/dsh-tool-fs-search')?.config?.sampleOverCapGlobResults === false,
+    'mainToolMode=ask-edit 仅新增 tool-fs(applyPatch:false) + 带有效配置的 tool-fs-search',
+  )
+  for (const pkgName of [
+    '@deepseek-ai/dsh-tool-bash',
+    '@deepseek-ai/dsh-tool-pwsh',
+    '@deepseek-ai/dsh-tool-workflow',
+    '@deepseek-ai/dsh-tool-jobs',
+    '@deepseek-ai/dsh-tool-schedule',
+    '@deepseek-ai/dsh-tool-goal',
+    '@deepseek-ai/dsh-tool-skill',
+    '@deepseek-ai/dsh-tool-todo',
+    '@deepseek-ai/dsh-plan-mode',
+  ]) {
+    check(!readonlyRows.some((r) => r?.name === pkgName), `readonly 永不挂载 ${pkgName}`)
+    check(!askEditRows.some((r) => r?.name === pkgName), `ask-edit 永不挂载 ${pkgName}`)
   }
   for (const row of toolRows) {
     const cfg = row.config ?? {}
@@ -482,15 +630,19 @@ export function checksFor(surface) {
   )
   check(/团队施工/.test(custom?.description ?? ''), '自定义 preset 名称进入 description')
   check(
-    surface.selfFallback.fallback === true && /递归派工/.test(surface.selfFallback.reason ?? ''),
+    surface.selfFallback.fallback === true && /递归派工|内部预设/.test(surface.selfFallback.reason ?? ''),
     'dev-plan 自身被拒绝，避免递归',
+  )
+  check(
+    surface.scoutSelfFallback?.fallback === true && surface.scribeSelfFallback?.fallback === true,
+    'dev-plan-scout 与 dev-plan-scribe 也被拒绝作 developMode',
   )
   check(
     surface.modules.settings.DEFAULT_SETTINGS.guardAllSubagents === false,
     '默认 guardAllSubagents=false（只守 dev-plan 子代理）',
   )
   check(/已回退 standard/.test(findPresetPlugin(fallback, 'persona')?.config?.prefix ?? ''), '回退 persona 写明「已回退 standard」')
-  check(/不是静默降级/.test(findPresetPlugin(fallback, 'persona')?.config?.prefix ?? ''), '回退说明不是静默降级')
+  check(/回退显式可见/.test(findPresetPlugin(fallback, 'persona')?.config?.prefix ?? ''), '回退说明显式可见')
   check(
     JSON.stringify(findTool(withEffort, 'develop')?.config?.agentOptions) ===
       JSON.stringify({ provider: 'dsh-opencode-go', model: 'deepseek-v4.1-flash', reasoningEffort: 'high' }),
@@ -514,38 +666,44 @@ export function checksFor(surface) {
   )
 
   const personaRow = findPresetPlugin(standard, 'persona')
-  const persona = `${personaRow?.config?.prefix ?? ''}${personaRow?.config?.suffix ?? ''}`
-  check(typeof personaRow?.config?.prefix === 'string' && personaRow.config.prefix.length > 1000, 'persona.prefix 是实质内容（>1000 字符）', `${personaRow?.config?.prefix?.length ?? 0} chars`)
-  check(typeof personaRow?.config?.suffix === 'string' && personaRow.config.suffix.length > 100, 'persona.suffix 非空（不遮蔽部署级 suffix）')
+  const personaPrefix = personaRow?.config?.prefix ?? ''
+  const personaSuffix = personaRow?.config?.suffix ?? ''
+  const persona = `${personaPrefix}${personaSuffix}`
+  const personaLength = personaPrefix.length + personaSuffix.length
+  check(
+    typeof personaPrefix === 'string' && personaPrefix.length > 1000 && personaLength <= 6000,
+    'persona 长度在性能预算内（1000 < total <= 6000 字符）',
+    `${personaLength} chars`,
+  )
+  check(
+    !personaPrefix.includes('ROLE-TEMPLATE:SCOUT:BEGIN') && !personaPrefix.includes('ROLE-TEMPLATE:SCRIBE:BEGIN'),
+    '主窗 prefix 不再使用旧的千字长模板',
+  )
+  check(
+    personaPrefix.includes('仅给子代理用') &&
+      personaPrefix.includes('【仅子代理用 · 侦察/复核约束】') &&
+      personaPrefix.includes('【仅子代理用 · 文书落盘约束】'),
+    '主窗 persona 嵌入紧凑版子代理模板并标注仅给子代理用',
+  )
+  check(typeof personaSuffix === 'string' && personaSuffix.length > 100, 'persona.suffix 非空（不遮蔽部署级 suffix）')
   check(!/\{\{/.test(persona), 'persona 不含模板变量')
-  check(!/不是[\u201c"]被要求不要用/.test(persona), 'persona 没有错误的硬保证')
 
+  const nonePersonaPrefix = findPresetPlugin(noneMode, 'persona')?.config?.prefix ?? ''
+  check(nonePersonaPrefix.includes('永不亲自读写仓库、写代码或跑 Shell'), 'persona(none) 说明主窗永不亲自写代码')
   for (const [marker, label] of [
-    ['你自身永不亲自写代码', 'persona 说明主窗永不亲自写代码'],    ['默认只规划与复核', 'persona 说明默认只规划/复核'],
-    ['只有用户明确说“开工', 'persona 只在用户明确开工时派 develop'],
+    ['永远禁止跑 Shell/测试命令（无 Shell 工具）', 'persona(默认 ask-edit) 严禁跑 Shell/测试命令'],
+    ['必须先获用户本轮明确同意“主窗直接改”', 'persona(默认 ask-edit) 写改必须先获用户同意'],
+    ['默认只规划与复核', 'persona 说明默认只规划/复核'],
+    ['开工/施工/修复', 'persona 只在用户明确开工时派 develop'],
     ['name=developer', 'persona 固定 developer'],
     ['send_message', 'persona 用 send_message 续派'],
-    ['不反复新建子代理', 'persona 不反复新建子代理'],
+    ['不反复请示', 'persona 普通实现不反复请示'],
     ['独立 review', 'persona 施工后可派独立 review'],
-    ['返工给同一 developer', 'persona 返工给同一 developer'],
-    ['不依赖双窗按钮', 'persona 返工不依赖双窗按钮'],
-    ['扩大范围、越权改动、不可逆风险', 'persona 只在扩大范围/越权/不可逆风险时问用户'],
-    ['不要再次请求同一个开工批准', 'persona 不重复请求开工批准'],
+    ['仅范围扩大、风险变化或宿主权限要求', 'persona 仅范围/风险/权限变化重确认'],
     ['不向人类提问', 'develop 不向人类提问'],
-    ['不能把子代理的自述当作自己已经运行测试', 'persona 禁止把子代理自述当成自己运行测试'],
-    ['同一任务不得同时使用 develop 和 rework_task/ask_worker', '双通道互斥'],
-    ['目标：', '任务书含目标'],
-    ['非目标：', '任务书含非目标'],
-    ['验收标准：', '任务书含验收标准'],
-    ['允许改动路径：', '任务书含允许改动路径'],
-    ['完成定义：', '任务书含完成定义'],
-    ['汇报格式：', '任务书含汇报格式'],
-    ['1. 改动：', '汇报格式含改动'],
-    ['2. 真实命令与输出：', '汇报格式含真实命令与输出'],
-    ['3. 自验收：', '汇报格式含自验收'],
-    ['4. 风险：', '汇报格式含风险'],
-    ['5. 假设与未验证项：', '汇报格式含假设与未验证项'],
-    // P0 流程提效
+    ['不得把子代理自述当自己跑过测试', 'persona 禁止把子代理自述当成自己运行测试'],
+    ['同一任务严禁混用 develop 与 rework_task/ask_worker', '双通道互斥'],
+    // P0 流程提效与单契约复用
     ['快速路径', 'P0 风险路由含快速路径'],
     ['标准路径', 'P0 风险路由含标准路径'],
     ['高风险路径', 'P0 风险路由含高风险路径'],
@@ -553,53 +711,50 @@ export function checksFor(surface) {
     ['影响面', 'P0 判定维度含影响面'],
     ['可逆性', 'P0 判定维度含可逆性'],
     ['可验证性', 'P0 判定维度含可验证性'],
-    ['提高风险等级', 'P0 证据不足时提高风险等级'],
-    ['绝不因验证困难降低路径等级', 'P0 绝不因验证困难降低路径等级'],
-    ['实际变更证据', 'P0 完工必须附实际变更证据'],
-    ['不能只给文件清单', 'P0 不能只给文件清单'],
-    ['不得声称审过实际 diff', 'P0 摘要不得冒充 diff 审查'],
+    ['必须升级路径', 'P0 证据不足时提高风险等级'],
+    ['绝不因验证困难降级', 'P0 绝不因验证困难降级'],
+    ['分层变更证据', 'P0 完工必须附分层变更证据'],
+    ['只有文件清单或口头摘要不算审过 diff', 'P0 不能只给文件清单'],
+    ['不得声称核对过 diff', 'P0 摘要不得冒充 diff 审查'],
     ['补证据', 'P0 缺证据要同一 developer 补证据'],
-    ['一次性开工契约', 'P0 一次性开工契约'],
-    ['接口/依赖', '任务书含接口/依赖'],
+    ['开工契约', 'P0 一次性开工契约'],
+    ['目标', '任务书含目标'],
+    ['非目标', '任务书含非目标'],
+    ['允许与禁止改动路径', '任务书含允许改动路径'],
+    ['接口与兼容约束', '任务书含接口/依赖'],
+    ['验收标准', '任务书含验收标准'],
     ['检查命令', '任务书含检查命令'],
-    ['风险/回退', '任务书含风险/回退'],
-    ['普通文件编辑和实现细节不反复等待批准', 'P0 普通实现不反复等待批准'],
-    ['只有范围扩大、风险变化或宿主权限要求', 'P0 仅范围/风险/权限变化重确认'],
+    ['风险', '任务书含风险/回退'],
     ['最小切片', 'P0 验收前置含最小切片'],
     ['语法/静态契约', 'P0 验收排序含语法/静态契约'],
     ['针对性测试', 'P0 验收排序含针对性测试'],
-    ['必要运行/GUI 验收', 'P0 验收排序含必要运行/GUI'],
-    ['静态检查不等于真实验证', 'P0 禁止静态检查冒充真实验证'],
+    ['必要运行/GUI', 'P0 验收排序含必要运行/GUI'],
+    ['静态检查/单测不等于真实运行验收', 'P0 禁止静态检查冒充真实验证'],
     ['非阻塞协作', 'P0 非阻塞协作'],
     ['不轮询', 'P0 主窗不轮询'],
-    ['不忙等', 'P0 主窗不忙等'],
+    ['不 `sleep`', 'P0 主窗不忙等'],
     ['不重复施工', 'P0 主窗不重复施工'],
-    ['不重复读取', 'P0 主窗不重复读取 developer 文件'],
-    ['developer 只在阻塞、范围冲突或关键契约需要决策时打断主窗', 'P0 developer 打断边界'],
-    ['verified / partial / failed', 'P0 汇报含验证状态分级'],
-    ['实际 diff 和关键证据', 'P0 主窗审实际 diff/关键证据'],
-    ['阻塞问题', 'P0 阻塞问题返工'],
-    ['非阻塞建议', 'P0 非阻塞建议不无限打磨'],
-    ['主窗最终审查责任不外包', 'P0 最终审查责任不外包'],
-    ['recon：只在缺少事实', 'P0 recon 仅缺事实'],
-    ['review：只在高风险', 'P0 review 仅高风险/需要'],
-    ['scribe：只在文档属于验收范围', 'P0 scribe 仅验收/用户需要'],
+    ['读写 developer 正在改的文件', 'P0 主窗不重复读取 developer 文件'],
+    ['developer 仅在阻塞、范围冲突或关键契约决策时打断', 'P0 developer 打断边界'],
+    ['verified|partial|failed|未验证', 'P0 汇报含验证状态分级'],
+    ['阻塞', 'P0 阻塞问题返工'],
+    ['不无限打磨', 'P0 非阻塞建议不无限打磨'],
+    ['review 不替代主窗最终审查', 'P0 最终审查责任不外包'],
+    ['name=scout', 'recon 首次固定 name=scout 复用上下文'],
     ['文本不是派工', 'P0 文本不是派工'],
-    ['必须实际调用 develop', 'P0 授权后必须实际调用 develop'],
-    ['只有工具接受后才可说“已派出 developer”', 'P0 工具接受后才可称已派出'],
-    ['未派工', 'P0 未派工如实报告'],
-    ['任务书是 develop 的 prompt 参数', 'P0 任务书是工具参数不是聊天交付'],
-    ['不得停在计划、前言或任务书文本', 'P0 授权后不得停在任务书文本'],
+    ['实际调用 develop', 'P0 授权后必须实际调用 develop'],
+    ['已派出 developer', 'P0 工具接受后才可称已派出'],
+    ['未派工：原因', 'P0 未派工如实报告'],
     ['实际调用 send_message', 'P0 返工必须实际 send_message'],
     // 施工目录/权限防护
-    ['施工目录与权限', 'persona 写明施工目录与权限'],
-    ['工具创建参数', 'persona 要求用创建参数指定真实施工目录'],
+    ['施工目录边界', 'persona 写明施工目录与权限'],
     ['cwd', 'persona 明确 cwd 参数'],
     ['可写工作区', 'persona 派工前检查可写工作区'],
-    ['不得先以其他目录 spawn', 'persona 禁止先建后 cd'],
-    ['不假设已有子代理权限会随之扩大', 'persona 不假设权限会扩大'],
-    ['沙箱模式', 'persona 权限失败记录沙箱模式'],
-    ['真实错误原文', 'persona 权限失败记录真实错误'],
+    ['已存在的父目录', 'persona 允许工作区内未建子目录以父目录 cwd 派工自建'],
+    ['working_directory', 'persona 禁止先建后 cd'],
+    ['父会话事后提权不扩大已有子代理权限', 'persona 不假设权限会扩大'],
+    ['沙箱', 'persona 权限失败记录沙箱模式'],
+    ['原错', 'persona 权限失败记录真实错误'],
   ]) {
     check(persona.includes(marker), label, marker)
   }
@@ -616,30 +771,16 @@ export function checksFor(surface) {
     'P0 没有“文本任务书即视为已派工”的错误说法',
   )
 
-  // 角色模板仍然保留
-  const scoutTemplate = extractTemplate(personaRow?.config?.prefix ?? '', 'SCOUT')
-  const scribeTemplate = extractTemplate(personaRow?.config?.prefix ?? '', 'SCRIBE')
-  check(typeof scoutTemplate === 'string' && scoutTemplate.length > 300, '侦察/复核角色模板存在', `${scoutTemplate?.length ?? 0} chars`)
-  check(typeof scribeTemplate === 'string' && scribeTemplate.length > 200, '文书角色模板存在', `${scribeTemplate?.length ?? 0} chars`)
-  const scoutAllowMatch = /允许使用的工具只有[：:]\s*([^。\n]+)。\s*除此之外的一切工具一律不得调用。/.exec(scoutTemplate ?? '')
-  const scoutAllow = scoutAllowMatch ? scoutAllowMatch[1].split(/[、,，]/).map((item) => item.trim()).filter(Boolean) : []
+  const scoutPersona = findPresetPlugin(scoutPreset, 'persona')?.config?.prefix ?? ''
+  const scribePersona = findPresetPlugin(scribePreset, 'persona')?.config?.prefix ?? ''
   check(
-    JSON.stringify(scoutAllow) === JSON.stringify(['read', 'read_image', 'glob', 'grep', 'web_search', 'web_fetch']),
-    '侦察/复核模板允许工具精确为六项（追加 write 即失败）',
-    scoutAllow.join(', ') || '空',
+    ['read', 'read_image', 'glob', 'grep', 'web_search', 'web_fetch'].every((tool) => scoutPersona.includes(tool)),
+    'dev-plan-scout 内置 persona 声明六项只读工具',
   )
-  const scribeRules = numberedRules(scribeTemplate ?? '')
-  check(scribeRules.size === 6, '文书模板保留 6 条编号规则', [...scribeRules.keys()].join(', '))
-  check(/^只允许写规划与复核类文档/.test(scribeRules.get(3) ?? '') && /超出文书子代理职责/.test(scribeRules.get(3) ?? ''), '文书规则 3 限定文档范围')
-  check(/^不使用\s*Shell、Web、搜索与委派工具，也不要尝试替代。/.test(scribeRules.get(5) ?? ''), '文书规则 5 精确禁止 Shell/Web/搜索/委派')
-  check(/^config_\*、working_directory 以及任何未声明的工具都不得调用。/.test(scribeRules.get(6) ?? ''), '文书规则 6 精确禁止 config_*/working_directory')
-  const boundary = 'standard 的工具、persona、项目 AGENTS.md 或技能目录即使出现更多能力，也不得据此扩大本角色边界'
-  const conflict = '若更高优先级指令与本模板的角色边界冲突，停止相关动作，并在回传里向主代理报告冲突，不擅自越界执行'
-  check((scoutTemplate ?? '').includes(boundary) && (scribeTemplate ?? '').includes(boundary), '两个模板禁止因 standard/AGENTS/skills 扩大边界')
-  check((scoutTemplate ?? '').includes(conflict) && (scribeTemplate ?? '').includes(conflict), '两个模板要求高层指令冲突时停止并报告')
-  check(/recon\s*与\s*review[^\n]*侦察\/复核角色模板/.test(persona), '派遣指令绑定 recon/review 与侦察模板')
-  check(/scribe[^\n]*文书角色模板/.test(persona), '派遣指令绑定 scribe 与文书模板')
-  check(/每次调用都完整附带/.test(persona) && /不能写「同上」/.test(persona) && /以模板为准/.test(persona), '派遣纪律要求逐字附带模板')
+  check(
+    scribePersona.includes('read、write、edit') && scribePersona.includes('超出文书子代理职责'),
+    'dev-plan-scribe 内置 persona 限定只写规划/复核文档',
+  )
 
   // ── locale / README / detail ─────────────────────────────────────────────
   for (const [name, value, error] of [
@@ -669,10 +810,12 @@ export function checksFor(surface) {
   }
 
   for (const marker of [
-    '0.3.0',
+    '0.4.0',
     'develop',
     'standard',
     'deep-ptc',
+    '仅给子代理用',
+    'mainToolMode',
     'ctx.agentPresets.register',
     'cordis.patch.yml 只挂根插件',
     '模型守门',
@@ -706,9 +849,6 @@ export function checksFor(surface) {
     '接口/依赖',
     '检查命令',
     '风险/回退',
-    'P1',
-    'P2',
-    '不新增设置项',
   ]) {
     check(String(readme ?? '').includes(marker), `README 含 P0 说明：${marker}`)
   }
@@ -722,10 +862,12 @@ export function checksFor(surface) {
   }
 
   for (const marker of [
-    '0.3.0',
+    '0.4.0',
     'develop',
     'standard',
     'deep-ptc',
+    '仅给子代理用',
+    'mainToolMode',
     '模型守门',
     '已回退 standard',
     '未验证',
@@ -798,8 +940,13 @@ async function behaviorChecks() {
   try {
     index.apply(ctx.ctx, { ...modules.settings.DEFAULT_SETTINGS }, { verificationDelayMs: 0 })
     await ctx.flush()
-    check(registry.definitions.length === 1, 'apply 动态注册 1 个 preset', String(registry.definitions.length))
-    check(registry.definitions[0]?.id === 'dev-plan', '动态注册 id=dev-plan')
+    check(
+      registry.definitions.length === 1 &&
+        registry.definitions[0]?.id === 'dev-plan',
+      'apply 只动态注册 1 个 preset（dev-plan，不在公开列表暴露内部子预设）',
+      registry.definitions.map((d) => d.id).join(','),
+    )
+    check(registry.definitions.some((d) => d.id === 'dev-plan'), '动态注册 id=dev-plan')
     check(typeof webServer.handlers.get === 'function', 'webServer 路由注册接口存在')
     const stateHandler = webServer.handlers.get('/plugins/dev-plan-presets/state')
     check(typeof stateHandler === 'function', '注册 /plugins/dev-plan-presets/state')
@@ -807,6 +954,9 @@ async function behaviorChecks() {
     check(state.code === 200, 'state 路由 GET 200', String(state.code))
     check(state.body?.effectiveMode === 'standard', 'state 默认 effectiveMode=standard', String(state.body?.effectiveMode))
     check(state.body?.fallback?.active === false, 'state 默认无回退')
+    check(typeof state.headers?.etag === 'string' && state.headers.etag.length > 0, 'state 响应头带 etag')
+    const state304 = await callRoute(stateHandler, 'GET', undefined, { 'if-none-match': state.headers.etag })
+    check(state304.code === 304 && state304.body === null, 'state 命中 If-None-Match 返回 304 空体', String(state304.code))
 
     const configHandler = webServer.handlers.get('/plugins/dev-plan-presets/config')
     check(typeof configHandler === 'function', '注册 /plugins/dev-plan-presets/config')
@@ -874,7 +1024,7 @@ async function behaviorChecks() {
     })
     index.apply(entryCtx.ctx, { ...modules.settings.DEFAULT_SETTINGS, developMode: 'deep-ptc' }, { verificationDelayMs: 0 })
     await entryCtx.flush()
-    const entryDefinition = entryRegistry.definitions[0]
+    const entryDefinition = entryRegistry.definitions.find((d) => d.id === 'dev-plan')
     check(
       entryDefinition?.plugins.find((row) => row.id === 'tool-subagent-develop')?.config?.agentPreset === 'standard',
       '只有 loader entry（LOADING）时保守回退 standard',
@@ -889,14 +1039,14 @@ async function behaviorChecks() {
     const goodCtx = createFakeContext({ registry: goodRegistry })
     index.apply(goodCtx.ctx, { ...modules.settings.DEFAULT_SETTINGS, developMode: 'deep-ptc' }, { verificationDelayMs: 0 })
     await goodCtx.flush()
-    const goodDefinition = goodRegistry.definitions[0]
+    const goodDefinition = goodRegistry.definitions.find((d) => d.id === 'dev-plan')
     check(
       goodDefinition?.plugins.find((row) => row.id === 'tool-subagent-develop')?.config?.agentPreset === 'deep-ptc',
       'registry 中存在 deep-ptc 时 develop 使用 deep-ptc',
     )
     check(
       goodDefinition?.plugins.find((row) => row.id === 'tool-subagent-recon')?.config?.agentPreset === 'standard',
-      'deep-ptc 时 recon 仍为 standard',
+      'deep-ptc 时 recon 仍使用 standard',
     )
     await goodCtx.dispose()
   }
@@ -978,7 +1128,11 @@ async function behaviorChecks() {
   }
   {
     const ctx4 = createFakeContext({ registry: createFakeRegistry() })
-    index.apply(ctx4.ctx, { ...modules.settings.DEFAULT_SETTINGS, modelGuardMode: 'off' }, { verificationDelayMs: 0 })
+    index.apply(
+      ctx4.ctx,
+      { ...modules.settings.DEFAULT_SETTINGS, modelGuardMode: 'off', mainToolMode: 'none' },
+      { verificationDelayMs: 0 },
+    )
     await ctx4.flush()
     check(!ctx4.listeners.get('agent/created'), 'off 模式不注册 agent/created')
     await ctx4.dispose()
@@ -1107,18 +1261,26 @@ const MUTATIONS = [
     },
   },
   {
-    name: '主窗被加回 fs 工具',
-    expect: '主窗不挂载',
+    name: '主窗(none)被加回 fs 工具',
+    expect: '主窗(none)不挂载',
     mutate(surface) {
-      surface.standard.plugins.push({ id: 'tool-fs', name: '@deepseek-ai/dsh-tool-fs' })
+      surface.noneMode.plugins.push({ id: 'tool-fs', name: '@deepseek-ai/dsh-tool-fs' })
     },
   },
   {
-    name: 'persona 删掉“永不亲自写代码”',
-    expect: 'persona 说明主窗永不亲自写代码',
+    name: 'persona(none) 删掉“永不亲自写代码”',
+    expect: 'persona(none) 说明主窗永不亲自写代码',
+    mutate(surface) {
+      const row = findPresetPlugin(surface.noneMode, 'persona')
+      row.config.prefix = row.config.prefix.replaceAll('永不亲自读写仓库、写代码或跑 Shell', '应当亲自写代码')
+    },
+  },
+  {
+    name: 'persona(默认 ask-edit) 删掉“必须先获用户本轮明确同意”',
+    expect: 'persona(默认 ask-edit) 写改必须先获用户同意',
     mutate(surface) {
       const row = findPresetPlugin(surface.standard, 'persona')
-      row.config.prefix = row.config.prefix.replaceAll('你自身永不亲自写代码', '你应当写代码')
+      row.config.prefix = row.config.prefix.replaceAll('必须先获用户本轮明确同意“主窗直接改”', '可以直接改代码')
     },
   },
   {
@@ -1191,14 +1353,41 @@ const MUTATIONS = [
     },
   },
   {
-    name: '角色模板被整段删除',
-    expect: '侦察/复核角色模板存在',
+    name: 'persona 超过 6000 字符预算',
+    expect: 'persona 长度在性能预算内',
     mutate(surface) {
       const row = findPresetPlugin(surface.standard, 'persona')
-      row.config.prefix = row.config.prefix.replace(
-        /^[ \t]*=+ ROLE-TEMPLATE:SCOUT:BEGIN =+[ \t]*\r?\n[\s\S]*?^[ \t]*=+ ROLE-TEMPLATE:SCOUT:END =+[ \t]*$\r?\n?/m,
-        '',
-      )
+      row.config.prefix += '冗余文本'.repeat(1000)
+    },
+  },
+  {
+    name: '主窗重新内联 ROLE-TEMPLATE 长模板',
+    expect: '主窗 prefix 不再使用旧的千字长模板',
+    mutate(surface) {
+      const row = findPresetPlugin(surface.standard, 'persona')
+      row.config.prefix += '\n===== ROLE-TEMPLATE:SCOUT:BEGIN =====\n'
+    },
+  },
+  {
+    name: '子代理模板缺少“仅给子代理用”标注',
+    expect: '主窗 persona 嵌入紧凑版子代理模板并标注仅给子代理用',
+    mutate(surface) {
+      const row = findPresetPlugin(surface.standard, 'persona')
+      row.config.prefix = row.config.prefix.replaceAll('仅给子代理用', '给主窗用')
+    },
+  },
+  {
+    name: 'dev-plan-scout 混入 bash 工具',
+    expect: 'dev-plan-scout 不含 @deepseek-ai/dsh-tool-bash',
+    mutate(surface) {
+      surface.scoutPreset.plugins.push({ id: 'tool-bash', name: '@deepseek-ai/dsh-tool-bash' })
+    },
+  },
+  {
+    name: 'ask-edit 混入 bash 工具',
+    expect: 'ask-edit 永不挂载 @deepseek-ai/dsh-tool-bash',
+    mutate(surface) {
+      surface.askEditMode.plugins.push({ id: 'tool-bash', name: '@deepseek-ai/dsh-tool-bash' })
     },
   },
   {
@@ -1207,7 +1396,7 @@ const MUTATIONS = [
     mutate(surface) {
       const row = findPresetPlugin(surface.standard, 'persona')
       row.config.prefix = row.config.prefix.replaceAll(
-        '同一任务不得同时使用 develop 和 rework_task/ask_worker',
+        '同一任务严禁混用 develop 与 rework_task/ask_worker',
         '可以同时使用 develop 和 rework_task',
       )
     },
@@ -1240,10 +1429,10 @@ const MUTATIONS = [
   },
   {
     name: 'P0 完工证据退化为改动摘要',
-    expect: 'P0 完工必须附实际变更证据',
+    expect: 'P0 完工必须附分层变更证据',
     mutate(surface) {
       const row = findPresetPlugin(surface.standard, 'persona')
-      row.config.prefix = row.config.prefix.replaceAll('实际变更证据', '改动摘要')
+      row.config.prefix = row.config.prefix.replaceAll('分层变更证据', '改动摘要')
     },
   },
   {
@@ -1251,7 +1440,7 @@ const MUTATIONS = [
     expect: 'P0 不能只给文件清单',
     mutate(surface) {
       const row = findPresetPlugin(surface.standard, 'persona')
-      row.config.prefix = row.config.prefix.replaceAll('不能只给文件清单', '只给文件清单也可以作为证据')
+      row.config.prefix = row.config.prefix.replaceAll('只有文件清单或口头摘要不算审过 diff', '只给文件清单也可以作为证据')
     },
   },
   {
@@ -1402,10 +1591,8 @@ const MUTATIONS = [
     expect: 'P0 工具接受后才可称已派出',
     mutate(surface) {
       const row = findPresetPlugin(surface.standard, 'persona')
-      row.config.prefix = row.config.prefix.replaceAll(
-        '只有工具接受后才可说“已派出 developer”',
-        '没有调用也可以说已派出 developer',
-      )
+      row.config.prefix = row.config.prefix.replaceAll('已派出 developer', '已直接派出')
+      row.config.suffix = row.config.suffix.replaceAll('已派出 developer', '已直接派出')
     },
   },
   {
@@ -1413,8 +1600,8 @@ const MUTATIONS = [
     expect: 'P0 未派工如实报告',
     mutate(surface) {
       const row = findPresetPlugin(surface.standard, 'persona')
-      row.config.prefix = row.config.prefix.replaceAll('未派工', '已派工')
-      row.config.suffix = row.config.suffix.replaceAll('未派工', '已派工')
+      row.config.prefix = row.config.prefix.replaceAll('未派工：原因', '已派工')
+      row.config.suffix = row.config.suffix.replaceAll('未派工：原因', '已派工')
     },
   },
   {
@@ -1461,7 +1648,7 @@ const MUTATIONS = [
     expect: '任务书含接口/依赖',
     mutate(surface) {
       const row = findPresetPlugin(surface.standard, 'persona')
-      row.config.prefix = row.config.prefix.replaceAll('接口/依赖', '接口')
+      row.config.prefix = row.config.prefix.replaceAll('接口与兼容约束', '接口')
     },
   },
   {
@@ -1469,7 +1656,7 @@ const MUTATIONS = [
     expect: 'P0 禁止静态检查冒充真实验证',
     mutate(surface) {
       const row = findPresetPlugin(surface.standard, 'persona')
-      row.config.prefix = row.config.prefix.replaceAll('静态检查不等于真实验证', '静态检查可以代表真实验证')
+      row.config.prefix = row.config.prefix.replaceAll('静态检查/单测不等于真实运行验收', '静态检查可以代表真实验证')
     },
   },
   {
@@ -1485,7 +1672,7 @@ const MUTATIONS = [
     expect: 'P0 汇报含验证状态分级',
     mutate(surface) {
       const row = findPresetPlugin(surface.standard, 'persona')
-      row.config.prefix = row.config.prefix.replaceAll('verified / partial / failed', '通过/失败')
+      row.config.prefix = row.config.prefix.replaceAll('verified|partial|failed|未验证', '通过/失败')
     },
   },
   {
@@ -1493,14 +1680,31 @@ const MUTATIONS = [
     expect: 'P0 最终审查责任不外包',
     mutate(surface) {
       const row = findPresetPlugin(surface.standard, 'persona')
-      row.config.prefix = row.config.prefix.replaceAll('主窗最终审查责任不外包', '主窗最终审查可外包给 review')
+      row.config.prefix = row.config.prefix.replaceAll('review 不替代主窗最终审查', '主窗最终审查可外包给 review')
     },
   },
   {
     name: '版本号未更新',
-    expect: 'version=0.3.0',
+    expect: 'version=0.4.0',
     mutate(surface) {
-      surface.pkg.version = '0.2.0'
+      surface.pkg.version = '0.3.0'
+    },
+  },
+  {
+    name: 'index 恢复冗余二次复检条件',
+    expect: 'index.js scheduleVerification 跳过已命中目标时的冗余二次全量探测',
+    mutate(surface) {
+      surface.files['index.js'] = String(surface.files['index.js']).replace(
+        'state.mode?.fallback === true || state.presets.checked !== true',
+        "settings.developMode !== 'standard' || state.presets.checked !== true",
+      )
+    },
+  },
+  {
+    name: 'client 删除 mainToolMode 控件',
+    expect: 'client 设置页包含字段 mainToolMode',
+    mutate(surface) {
+      surface.files['client.js'] = String(surface.files['client.js']).replaceAll('mainToolMode', 'removedMode')
     },
   },
   {
@@ -1542,7 +1746,7 @@ const MUTATIONS = [
     expect: 'persona 禁止先建后 cd',
     mutate(surface) {
       const row = findPresetPlugin(surface.standard, 'persona')
-      row.config.prefix = row.config.prefix.replaceAll('不得先以其他目录 spawn', '可以先以其他目录 spawn')
+      row.config.prefix = row.config.prefix.replaceAll('working_directory', 'other_dir')
     },
   },
   {

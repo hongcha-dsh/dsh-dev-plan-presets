@@ -1,5 +1,5 @@
 /**
- * dsh-dev-plan-presets — Host 插件入口（0.3.0）
+ * dsh-dev-plan-presets — Host 插件入口（0.4.0）
  *
  * 本包做四件事：
  *   1. 用 ctx.agentPresets.register() 动态注册 dev-plan preset：Cordis 配置变更后插件重建，
@@ -24,20 +24,22 @@ import {
 } from './settings.js'
 import {
   DEEP_PTC_PRESET_ID,
+  INTERNAL_PRESET_IDS,
   PRESET_ID,
   buildPresetDefinition,
   resolveDevelopMode,
 } from './preset.js'
-import { installModelGuard } from './guard.js'
+import { installMainStepBudget, installModelGuard } from './guard.js'
 
 export { Config }
 export const name = 'dev-plan-presets'
-export const version = '0.3.0'
+export const version = '0.4.0'
 export const DEEP_PTC_PACKAGE_NAME = 'dsh-deep-ptc-mode'
 
 const MAX_VIOLATIONS = 50
 const MAX_WARNINGS = 20
 const DEFAULT_VERIFY_DELAY_MS = 2000
+let instanceSeq = 0
 
 const isPlainObject = (value) =>
   typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -122,7 +124,7 @@ export async function probePresets(ctx, registry) {
   return { checked, timedOut, rows, ...(error === undefined ? {} : { error }) }
 }
 
-const send = (res, code, payload) => {
+const send = (res, code, payload, extraHeaders = {}) => {
   let body
   try {
     body = JSON.stringify(payload)
@@ -134,8 +136,18 @@ const send = (res, code, payload) => {
     'content-type': 'application/json; charset=utf-8',
     'cache-control': 'no-store',
     'content-length': Buffer.byteLength(body),
+    ...extraHeaders,
   })
   res.end(body)
+}
+
+const etagMatches = (headerValue, etag) => {
+  if (typeof headerValue !== 'string' || headerValue.trim().length === 0) return false
+  const bare = etag.replace(/^"|"$/g, '')
+  return headerValue
+    .split(',')
+    .map((part) => part.trim().replace(/^W\//i, ''))
+    .some((part) => part === '*' || part === etag || part === bare)
 }
 
 const readBody = async (req, limit) => {
@@ -214,18 +226,26 @@ const originProblem = (req, authoritativeOrigin) => {
  * Host 插件入口。
  * @param {any} ctx Cordis Context
  * @param {any} rawConfig Loader 配置（由 Config 校验/规范化）
- * @param {{ verificationDelayMs?: number, now?: () => number }} [runtime] 仅测试用的运行参数
+ * @param {{ verificationDelayMs?: number, prewarmDelayMs?: number, prewarmModelCatalog?: boolean, now?: () => number }} [runtime] 仅测试用的运行参数
  */
 export function apply(ctx, rawConfig, runtime = {}) {
   const settings = normalizeSettings(rawConfig)
+  const cachedRoute = routeOf(settings)
   const now = typeof runtime?.now === 'function' ? runtime.now : () => Date.now()
+  const instanceId = `${++instanceSeq}-${now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
   const violations = []
   const warnings = []
+  let stateVersion = 1
+  const currentStateTag = () => `${instanceId}-${stateVersion}`
+  const bumpState = () => {
+    stateVersion += 1
+  }
   const state = {
     settings,
     mode: null,
     definition: null,
     preset: null,
+    internalPresets: { scout: false, scribe: false },
     presets: { checked: false, timedOut: false, rows: [] },
     deepPtc: { available: false, checked: false },
     registration: 'pending',
@@ -244,6 +264,7 @@ export function apply(ctx, rawConfig, runtime = {}) {
   const rememberWarning = (message) => {
     warnings.unshift(String(message))
     if (warnings.length > MAX_WARNINGS) warnings.length = MAX_WARNINGS
+    bumpState()
   }
 
   const audit = (event, detail) => {
@@ -254,6 +275,7 @@ export function apply(ctx, rawConfig, runtime = {}) {
   const recordViolation = (entry) => {
     violations.unshift(entry)
     if (violations.length > MAX_VIOLATIONS) violations.length = MAX_VIOLATIONS
+    bumpState()
     log('warn', `模型守门：${entry?.text ?? '子代理越界'}`)
   }
 
@@ -271,6 +293,19 @@ export function apply(ctx, rawConfig, runtime = {}) {
     'dev-plan-presets: model guard',
   )
 
+  // ── 1b. 主会话步数预算软提醒（独立于 modelGuardMode，永不改模型/不取消）────
+  ctx.effect(
+    () =>
+      installMainStepBudget(ctx, settings, {
+        audit,
+        warn: (message) => {
+          rememberWarning(message)
+          log('warn', message)
+        },
+      }),
+    'dev-plan-presets: main step budget',
+  )
+
   // ── 2. 动态 preset 注册（等 agentPresets 服务可用）──────────────────────────
   const delayMs = Number.isFinite(runtime?.verificationDelayMs)
     ? Math.max(0, Number(runtime.verificationDelayMs))
@@ -279,9 +314,21 @@ export function apply(ctx, rawConfig, runtime = {}) {
   ctx.inject(['agentPresets'], (child) => {
     const registry = child.agentPresets
     let disposed = false
-    let release
+    let releases = []
     let queue = Promise.resolve()
     let timer
+
+    const releaseAll = async () => {
+      const current = releases
+      releases = []
+      for (let i = current.length - 1; i >= 0; i -= 1) {
+        try {
+          await current[i]()
+        } catch (error) {
+          log('warn', `释放动态 preset 失败：${String(error?.message ?? error)}`)
+        }
+      }
+    }
 
     const enqueue = (task) => {
       queue = queue
@@ -293,6 +340,7 @@ export function apply(ctx, rawConfig, runtime = {}) {
           const message = String(error?.message ?? error)
           state.registration = 'failed'
           state.error = message
+          bumpState()
           rememberWarning(message)
           log('error', `注册 dev-plan preset 失败：${message}`)
         })
@@ -319,7 +367,14 @@ export function apply(ctx, rawConfig, runtime = {}) {
         checked: probe?.checked === true,
         ...(probe?.timedOut ? { registryTimedOut: true } : {}),
       }
-      const definition = buildPresetDefinition({ settings, mode })
+
+      state.internalPresets = { scout: false, scribe: false }
+
+      const definition = buildPresetDefinition({
+        settings,
+        mode,
+        internalPresets: state.internalPresets,
+      })
       if (mode.fallback) {
         const message = `施工子代理已回退 standard：${mode.reason}`
         rememberWarning(message)
@@ -329,6 +384,7 @@ export function apply(ctx, rawConfig, runtime = {}) {
       } else {
         log('info', `施工子代理使用 ${mode.effective} preset（宿主预设目录已确认可用）。`)
       }
+
       const unregister = await registry.register(definition)
       if (typeof unregister !== 'function') {
         throw new Error('agentPresets.register 没有返回 disposer')
@@ -337,7 +393,7 @@ export function apply(ctx, rawConfig, runtime = {}) {
         await unregister()
         return
       }
-      release = unregister
+      releases = [unregister]
       state.definition = definition
       state.preset = {
         id: definition.id,
@@ -346,6 +402,7 @@ export function apply(ctx, rawConfig, runtime = {}) {
       }
       state.registration = 'active'
       state.error = null
+      bumpState()
     }
 
     const switchTo = async (probe) => {
@@ -373,18 +430,18 @@ export function apply(ctx, rawConfig, runtime = {}) {
           checked: probe?.checked === true,
           ...(probe?.timedOut ? { registryTimedOut: true } : {}),
         }
+        bumpState()
         return
       }
       // effective/fallback 相同但 reason 变了也要重新发布：description/persona 带着回退原因。
       state.registration = 'switching'
-      const previous = release
-      release = undefined
-      if (previous) await previous()
+      bumpState()
+      await releaseAll()
       await publish(probe)
     }
 
     const scheduleVerification = () => {
-      const needsRecheck = settings.developMode !== 'standard' || state.presets.checked !== true
+      const needsRecheck = state.mode?.fallback === true || state.presets.checked !== true
       if (!needsRecheck || delayMs <= 0) return
       timer = setTimeout(() => {
         timer = undefined
@@ -399,7 +456,7 @@ export function apply(ctx, rawConfig, runtime = {}) {
       if (typeof timer?.unref === 'function') timer.unref()
     }
 
-    // 卸载：先标记，等队列收敛，再交还动态 preset 的 disposer。
+    // 卸载：先标记，等队列收敛，再按逆序交还动态 preset 的 disposer。
     child.effect(
       () =>
         async () => {
@@ -407,16 +464,9 @@ export function apply(ctx, rawConfig, runtime = {}) {
           if (timer !== undefined) clearTimeout(timer)
           timer = undefined
           await queue.catch(() => {})
-          const current = release
-          release = undefined
-          if (current) {
-            try {
-              await current()
-            } catch (error) {
-              log('warn', `释放动态 preset 失败：${String(error?.message ?? error)}`)
-            }
-          }
+          await releaseAll()
           state.registration = 'disposed'
+          bumpState()
         },
       'dev-plan-presets: dynamic preset',
     )
@@ -453,6 +503,7 @@ export function apply(ctx, rawConfig, runtime = {}) {
       if (!llm || typeof llm.listProviders !== 'function') {
         modelCatalog = { checked: false, providers: [], failures: [], error: 'llm-unavailable' }
         modelCatalogUpdatedAt = now()
+        bumpState()
         return modelCatalog
       }
       let providers
@@ -466,6 +517,7 @@ export function apply(ctx, rawConfig, runtime = {}) {
           error: String(error?.message ?? error),
         }
         modelCatalogUpdatedAt = now()
+        bumpState()
         return modelCatalog
       }
       const normalized = (Array.isArray(providers) ? providers : [])
@@ -508,6 +560,7 @@ export function apply(ctx, rawConfig, runtime = {}) {
         .map((entry) => ({ provider: entry.provider, message: entry.failure }))
       modelCatalog = { checked: true, providers: out, failures, error: null }
       modelCatalogUpdatedAt = now()
+      bumpState()
       return modelCatalog
     })()
       .catch((error) => {
@@ -519,6 +572,7 @@ export function apply(ctx, rawConfig, runtime = {}) {
           error: String(error?.message ?? error).slice(0, 200),
         }
         modelCatalogUpdatedAt = now()
+        bumpState()
         return modelCatalog
       })
       .finally(() => {
@@ -540,11 +594,14 @@ export function apply(ctx, rawConfig, runtime = {}) {
 
   const buildState = async () => ({
     version,
+    stateVersion,
+    stateTag: currentStateTag(),
     config: state.settings,
-    route: routeOf(state.settings),
+    route: cachedRoute,
     requestedMode: state.mode?.requested ?? settings.developMode,
     effectiveMode: state.mode?.effective ?? null,
     modeName: state.mode?.name ?? null,
+    internalPresets: { ...state.internalPresets },
     fallback: {
       active: state.mode?.fallback === true,
       reason: state.mode?.reason ?? '',
@@ -553,6 +610,7 @@ export function apply(ctx, rawConfig, runtime = {}) {
       checked: state.presets.checked === true,
       timedOut: state.presets.timedOut === true,
       selfId: PRESET_ID,
+      disabledIds: INTERNAL_PRESET_IDS,
       rows: state.presets.rows,
       ...(typeof state.presets.error === 'string' ? { error: state.presets.error } : {}),
     },
@@ -583,7 +641,18 @@ export function apply(ctx, rawConfig, runtime = {}) {
               return
             }
             try {
-              send(res, 200, await buildState())
+              const snapshot = modelCatalogSnapshot()
+              void snapshot
+              const etag = `"${currentStateTag()}"`
+              if (etagMatches(req?.headers?.['if-none-match'], etag)) {
+                res.writeHead(304, {
+                  etag,
+                  'cache-control': 'no-store',
+                })
+                res.end()
+                return
+              }
+              send(res, 200, await buildState(), { etag })
             } catch (error) {
               send(res, 500, { error: String(error?.message ?? error), code: 'internal-error' })
             }
@@ -680,7 +749,26 @@ export function apply(ctx, rawConfig, runtime = {}) {
           },
         })
 
+        const prewarmEnabled = runtime?.prewarmModelCatalog !== false
+        const prewarmDelayMs = Number.isFinite(runtime?.prewarmDelayMs)
+          ? Math.max(0, Number(runtime.prewarmDelayMs))
+          : 300
+        let prewarmTimer
+        if (prewarmEnabled) {
+          prewarmTimer = setTimeout(() => {
+            prewarmTimer = undefined
+            if (now() - modelCatalogUpdatedAt >= MODEL_CATALOG_TTL_MS) {
+              void refreshModelCatalog()
+            }
+          }, prewarmDelayMs)
+          if (typeof prewarmTimer?.unref === 'function') prewarmTimer.unref()
+        }
+
         yield () => {
+          if (prewarmTimer !== undefined) {
+            clearTimeout(prewarmTimer)
+            prewarmTimer = undefined
+          }
           try {
             offState()
           } catch {

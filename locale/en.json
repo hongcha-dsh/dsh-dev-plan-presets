@@ -1,7 +1,7 @@
 {
   "meta": {
     "title": "Development planning & delivery Mode",
-    "description": "An expensive main model that only plans, dispatches and reviews: recon/review gather facts, scribe writes documents, and develop implements and reports back directly. standard is the default with no extra dependency; the development setup can also be chosen from presets installed on the host (such as deep-ptc), and the provider/model come from the host catalog. The model guard governs only this session's subagents by default and never the main session.",
+    "description": "An expensive main model for planning, delegation, review, and controlled micro-actions: recon/review/scribe run on standard using compact subagent-only templates embedded in the main preset (without cluttering the preset picker), and develop handles full implementation and Shell/tests. Main-session tool mode defaults to ask-edit (small read-only checks + local edits only after explicit user approval, never Shell), with readonly/none options and a soft step warning threshold. standard is the default with no extra dependency; the development setup can also be chosen from host presets (such as deep-ptc), while the model guard governs only this session's subagents by default and never the main session.",
     "detail": "detail.md"
   }
 }

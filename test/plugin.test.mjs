@@ -45,6 +45,7 @@ async function loadClientTestApi() {
       useEffect: () => {},
       useRef: (initial) => ({ current: initial }),
       useCallback: (fn) => fn,
+      useMemo: (fn) => fn(),
       cloneElement: (element) => element,
       Fragment: 'Fragment',
     }
@@ -57,7 +58,7 @@ async function loadClientTestApi() {
   }
 }
 
-test('默认设置：standard + pin，零 deep-ptc 依赖', () => {
+test('默认设置：standard + ask-edit + pin，零 deep-ptc 依赖', () => {
   const value = S.normalizeSettings(undefined)
   assert.equal(value.developMode, 'standard')
   assert.equal(value.modelGuardMode, 'pin')
@@ -65,6 +66,8 @@ test('默认设置：standard + pin，零 deep-ptc 依赖', () => {
   assert.equal(value.honorExplicit, false)
   assert.equal(value.audit, true)
   assert.equal(value.guardAllSubagents, false)
+  assert.equal(value.mainToolMode, 'ask-edit')
+  assert.equal(value.mainStepWarnThreshold, 6)
   assert.equal(value.childProvider, 'dsh-opencode-go')
   assert.equal(value.childModel, 'deepseek-v4.1-flash')
   assert.equal(value.childReasoningEffort, '')
@@ -91,9 +94,9 @@ test('Config 严格校验：默认值通过，非法枚举/空路由被拒绝', 
   assert.ok(badEffort.issues.some((issue) => issue.path[0] === 'childReasoningEffort'))
 })
 
-test('standard 定义：四个委派工具、develop=standard、主窗无施工工具', () => {
+test('standard 定义（mainToolMode=none）：四个委派工具、develop=standard、主窗无施工工具', () => {
   const definition = P.buildPresetDefinition({
-    settings: base(),
+    settings: { ...base(), mainToolMode: 'none' },
     mode: P.resolveDevelopMode({ requestedMode: 'standard' }),
   })
   assert.equal(definition.id, 'dev-plan')
@@ -169,7 +172,7 @@ test('回退显式可见：standard + 原因，写进 description 与 persona', 
   assert.match(definition.description, /已回退 standard/)
   const persona = definition.plugins.find((row) => row.id === 'persona').config.prefix
   assert.match(persona, /已回退 standard/)
-  assert.match(persona, /不是静默降级/)
+  assert.match(persona, /回退显式可见/)
 })
 
 test('deep-ptc 已注册但激活失败也回退', () => {
@@ -188,10 +191,10 @@ test('apply 动态注册 preset，并在 dispose 时交还 disposer', async () =
   const ctx = createFakeContext({ registry })
   index.apply(ctx.ctx, base(), { verificationDelayMs: 0 })
   await ctx.flush()
-  assert.equal(registry.definitions.length, 1)
-  assert.equal(registry.definitions[0].id, 'dev-plan')
-  const stateRoute = null
-  assert.equal(stateRoute, null)
+  assert.deepEqual(
+    registry.definitions.map((d) => d.id),
+    ['dev-plan'],
+  )
   await ctx.dispose()
   assert.deepEqual(registry.released, ['dev-plan'])
 })
@@ -206,12 +209,18 @@ test('state 路由：默认 standard、preset 描述可用', async () => {
   assert.equal(typeof handler, 'function')
   const response = await callRoute(handler, 'GET')
   assert.equal(response.code, 200)
-  assert.equal(response.body.version, '0.3.0')
+  assert.equal(response.body.version, '0.4.0')
+  assert.ok(Number.isInteger(response.body.stateVersion) && response.body.stateVersion >= 1)
+  assert.ok(typeof response.headers.etag === 'string' && response.headers.etag.length > 0)
   assert.equal(response.body.effectiveMode, 'standard')
   assert.equal(response.body.fallback.active, false)
   assert.equal(response.body.preset.id, 'dev-plan')
   assert.equal(response.body.config.guardAllSubagents, false)
+  assert.equal(response.body.config.mainToolMode, 'ask-edit')
+  assert.equal(response.body.config.mainStepWarnThreshold, 6)
   assert.equal(response.body.presets.selfId, 'dev-plan')
+  assert.deepEqual(response.body.presets.disabledIds, ['dev-plan', 'dev-plan-scout', 'dev-plan-scribe'])
+  assert.deepEqual(response.body.internalPresets, { scout: false, scribe: false })
   assert.match(response.body.preset.description, /standard/)
   await ctx.dispose()
 })
@@ -231,7 +240,8 @@ test('state 路由：请求 deep-ptc 但宿主没有时显式回退', async () =
   assert.deepEqual(response.body.presets.rows, [])
   assert.match(response.body.preset.description, /已回退 standard/)
   assert.ok(ctx.loggerCalls.warn.some((line) => line.includes('已回退 standard')))
-  assert.equal(registry.definitions[0].plugins.at(-1).config.agentPreset, 'standard')
+  const mainDef = registry.definitions.find((d) => d.id === 'dev-plan')
+  assert.equal(mainDef.plugins.at(-1).config.agentPreset, 'standard')
   await ctx.dispose()
 })
 
@@ -243,10 +253,11 @@ test('registry 中实际存在 deep-ptc 时，develop 使用 deep-ptc', async ()
   })
   index.apply(ctx.ctx, { ...base(), developMode: 'deep-ptc' }, { verificationDelayMs: 0 })
   await ctx.flush()
-  const definition = registry.definitions[0]
+  const definition = registry.definitions.find((d) => d.id === 'dev-plan')
   const develop = definition.plugins.find((row) => row.id === 'tool-subagent-develop')
   assert.equal(develop.config.agentPreset, 'deep-ptc')
   assert.equal(definition.plugins.find((row) => row.id === 'tool-subagent-recon').config.agentPreset, 'standard')
+  assert.equal(definition.plugins.find((row) => row.id === 'tool-subagent-scribe').config.agentPreset, 'standard')
   await ctx.dispose()
 })
 
@@ -261,7 +272,7 @@ test('目录中没有目标 preset 时回退，不把 loader entry 当可用证�
   })
   index.apply(ctx.ctx, { ...base(), developMode: 'deep-ptc' }, { verificationDelayMs: 0 })
   await ctx.flush()
-  const definition = registry.definitions[0]
+  const definition = registry.definitions.find((d) => d.id === 'dev-plan')
   assert.equal(definition.plugins.find((row) => row.id === 'tool-subagent-develop').config.agentPreset, 'standard')
   const state = await callRoute(webServer.handlers.get('/plugins/dev-plan-presets/state'), 'GET')
   assert.equal(state.body.effectiveMode, 'standard')
@@ -287,17 +298,19 @@ test('延迟复检可以在 registry 出现 deep-ptc 后把 develop 从 standard
   })
   index.apply(ctx.ctx, { ...base(), developMode: 'deep-ptc' }, { verificationDelayMs: 300 })
   await ctx.flush()
-  assert.equal(registry.definitions.length, 1)
+  const initialMains = registry.definitions.filter((d) => d.id === 'dev-plan')
+  assert.equal(initialMains.length, 1)
   assert.equal(
-    registry.definitions[0].plugins.find((row) => row.id === 'tool-subagent-develop').config.agentPreset,
+    initialMains[0].plugins.find((row) => row.id === 'tool-subagent-develop').config.agentPreset,
     'standard',
   )
 
   // 深度 PTC 完成动态注册后，下一次延迟复检应释放旧定义并注册 deep-ptc 版本。
   await sleep(600)
   await ctx.flush()
-  assert.ok(registry.definitions.length >= 2)
-  const latest = registry.definitions.at(-1)
+  const updatedMains = registry.definitions.filter((d) => d.id === 'dev-plan')
+  assert.ok(updatedMains.length >= 2)
+  const latest = updatedMains.at(-1)
   assert.equal(latest.plugins.find((row) => row.id === 'tool-subagent-develop').config.agentPreset, 'deep-ptc')
   assert.equal(latest.plugins.find((row) => row.id === 'tool-subagent-recon').config.agentPreset, 'standard')
   assert.ok(registry.released.includes('dev-plan'))
@@ -318,13 +331,15 @@ test('同 effective/fallback 但回退原因变化时，重新发布 preset 描�
   const ctx = createFakeContext({ registry, webServer })
   index.apply(ctx.ctx, { ...base(), developMode: 'deep-ptc' }, { verificationDelayMs: 300 })
   await ctx.flush()
-  assert.equal(registry.definitions.length, 1)
-  assert.match(registry.definitions[0].description, /first failure/)
+  const firstMains = registry.definitions.filter((d) => d.id === 'dev-plan')
+  assert.equal(firstMains.length, 1)
+  assert.match(firstMains[0].description, /first failure/)
 
   await sleep(600)
   await ctx.flush()
-  assert.ok(registry.definitions.length >= 2)
-  const latest = registry.definitions.at(-1)
+  const updatedMains = registry.definitions.filter((d) => d.id === 'dev-plan')
+  assert.ok(updatedMains.length >= 2)
+  const latest = updatedMains.at(-1)
   assert.match(latest.description, /second failure/)
   assert.doesNotMatch(latest.description, /first failure/)
   const state = await callRoute(webServer.handlers.get('/plugins/dev-plan-presets/state'), 'GET')
@@ -358,6 +373,8 @@ test('config 路由：用 configEditor 写回，非法值 400 且不写', async 
     honorExplicit: true,
     audit: false,
     guardAllSubagents: true,
+    mainToolMode: 'ask-edit',
+    mainStepWarnThreshold: 10,
   })
   assert.equal(ok.code, 200)
   assert.equal(configEditor.edits.length, 1)
@@ -371,6 +388,8 @@ test('config 路由：用 configEditor 写回，非法值 400 且不写', async 
     honorExplicit: true,
     audit: false,
     guardAllSubagents: true,
+    mainToolMode: 'ask-edit',
+    mainStepWarnThreshold: 10,
   })
   assert.equal(ok.body.ok, true)
   await ctx.dispose()
@@ -449,11 +468,15 @@ test('模型守门 audit：只记录，不 select、不打断', async () => {
   await ctx.dispose()
 })
 
-test('模型守门 off：不注册监听、不 select、不检查', async () => {
+test('模型守门 off（且 mainToolMode=none）：不注册监听、不 select、不检查', async () => {
   const registry = createFakeRegistry()
   const child = createFakeAgent({ id: 'child-4', parentSession: 'main', origin: 'subagent' })
   const ctx = createFakeContext({ registry })
-  index.apply(ctx.ctx, { ...base(), modelGuardMode: 'off' }, { verificationDelayMs: 0 })
+  index.apply(
+    ctx.ctx,
+    { ...base(), modelGuardMode: 'off', mainToolMode: 'none' },
+    { verificationDelayMs: 0 },
+  )
   await ctx.flush()
   assert.equal(ctx.listeners.get('agent/created'), undefined)
   assert.deepEqual(child.selects, [])
@@ -617,9 +640,13 @@ test('agent/disposed 清理 guard，随后插件卸载保持幂等', async () =>
   assert.equal(child.stepHandlers.length, 0)
 })
 
-test('modelGuardMode=off 不注册 agent/disposed', async () => {
+test('modelGuardMode=off（且 mainToolMode=none）不注册 agent/disposed', async () => {
   const ctx = createFakeContext({ registry: createFakeRegistry() })
-  index.apply(ctx.ctx, { ...base(), modelGuardMode: 'off' }, { verificationDelayMs: 0 })
+  index.apply(
+    ctx.ctx,
+    { ...base(), modelGuardMode: 'off', mainToolMode: 'none' },
+    { verificationDelayMs: 0 },
+  )
   await ctx.flush()
   assert.equal(ctx.listeners.get('agent/created'), undefined)
   assert.equal(ctx.listeners.get('agent/disposed'), undefined)
@@ -828,16 +855,16 @@ test('P0-1 风险分级：快速/标准/高风险 + 四维判定 + 快速路径�
   const definition = P.buildPresetDefinition({
     settings: base(),
     mode: P.resolveDevelopMode({ requestedMode: 'standard' }),
+    internalPresets: { scout: true, scribe: true },
   })
   const persona = definition.plugins.find((row) => row.id === 'persona').config.prefix
   for (const marker of ['快速路径', '标准路径', '高风险路径', '歧义', '影响面', '可逆性', '可验证性']) {
     assert.ok(persona.includes(marker), `缺 P0-1 标记：${marker}`)
   }
-  assert.match(persona, /快速路径不取消用户开工批准、developer 自验和主窗审查/)
-  assert.match(persona, /只选一条最短安全路径，不固定跑瀑布/)
-  // 证据不足只能升级风险/补证据，不能反向降级。
-  assert.match(persona, /提高风险等级|升级到能补足证据/)
-  assert.match(persona, /绝不因验证困难降低路径等级/)
+  assert.match(persona, /不可取消用户开工批准、developer 自验与主窗审查/)
+  assert.match(persona, /不为了流程派 recon\/review\/scribe/)
+  assert.match(persona, /必须升级路径/)
+  assert.match(persona, /绝不因验证困难降级/)
   assert.doesNotMatch(persona, /降低路径等级并补验收/)
 })
 
@@ -845,74 +872,76 @@ test('P0-2 一次性开工契约：字段齐全且普通实现不反复批准', 
   const definition = P.buildPresetDefinition({
     settings: base(),
     mode: P.resolveDevelopMode({ requestedMode: 'standard' }),
+    internalPresets: { scout: true, scribe: true },
   })
   const persona = definition.plugins.find((row) => row.id === 'persona').config.prefix
   for (const marker of [
-    '一次性开工契约',
-    '范围：',
-    '非目标：',
-    '允许路径：',
-    '接口/依赖：',
-    '验收条件：',
-    '检查命令：',
-    '风险/回退：',
+    '开工契约',
+    '目标',
+    '非目标',
+    '允许与禁止改动路径',
+    '接口与兼容约束',
+    '验收标准',
+    '检查命令',
+    '风险',
   ]) {
     assert.ok(persona.includes(marker), `缺 P0-2 标记：${marker}`)
   }
-  assert.match(persona, /普通文件编辑和实现细节不反复等待批准/)
-  assert.match(persona, /只有范围扩大、风险变化或宿主权限要求/)
+  assert.match(persona, /普通实现不反复请示/)
+  assert.match(persona, /仅范围扩大、风险变化或宿主权限要求/)
 })
 
 test('P0-3 验收前置：最小切片→语法/静态契约→针对性测试→必要运行/GUI，且静态不冒充真实验证', () => {
   const definition = P.buildPresetDefinition({
     settings: base(),
     mode: P.resolveDevelopMode({ requestedMode: 'standard' }),
+    internalPresets: { scout: true, scribe: true },
   })
   const persona = definition.plugins.find((row) => row.id === 'persona').config.prefix
-  const ordered = ['最小切片', '语法/静态契约', '针对性测试', '必要运行/GUI 验收']
+  const ordered = ['最小切片', '语法/静态契约', '针对性测试', '必要运行/GUI']
   let cursor = -1
   for (const marker of ordered) {
     const index = persona.indexOf(marker)
     assert.ok(index > cursor, `P0-3 顺序错误或缺标记：${marker}`)
     cursor = index
   }
-  assert.match(persona, /静态检查不等于真实验证/)
-  assert.match(persona, /verified \/ partial \/ failed \/ 未验证/)
+  assert.match(persona, /静态检查\/单测不等于真实运行验收/)
+  assert.match(persona, /verified\|partial\|failed\|未验证/)
 })
 
 test('P0-4 非阻塞协作：不轮询/不忙等/不重复施工/不重复读文件，developer 打断边界明确', () => {
   const definition = P.buildPresetDefinition({
     settings: base(),
     mode: P.resolveDevelopMode({ requestedMode: 'standard' }),
+    internalPresets: { scout: true, scribe: true },
   })
   const persona = definition.plugins.find((row) => row.id === 'persona').config.prefix
-  for (const marker of ['非阻塞协作', '不轮询', '不忙等', '不重复施工', '不重复读取']) {
+  for (const marker of ['非阻塞协作', '不轮询', '不 `sleep`', '不重复施工', '读写 developer 正在改的文件']) {
     assert.ok(persona.includes(marker), `缺 P0-4 标记：${marker}`)
   }
-  assert.match(persona, /developer 只在阻塞、范围冲突或关键契约需要决策时打断主窗/)
-  assert.match(persona, /验收准备、审查基线、资料研究、独立任务/)
+  assert.match(persona, /developer 仅在阻塞、范围冲突或关键契约决策时打断/)
 })
 
 test('P0-5 证据化审查与严重度返工：实际 diff、阻塞/非阻塞、最终责任不外包', () => {
   const definition = P.buildPresetDefinition({
     settings: base(),
     mode: P.resolveDevelopMode({ requestedMode: 'standard' }),
+    internalPresets: { scout: true, scribe: true },
   })
   const persona = definition.plugins.find((row) => row.id === 'persona').config.prefix
-  for (const marker of ['实际 diff 和关键证据', '阻塞问题', '非阻塞建议', '主窗最终审查责任不外包']) {
+  for (const marker of ['证据化审查', '阻塞', '重要', '建议', 'review 不替代主窗最终审查']) {
     assert.ok(persona.includes(marker), `缺 P0-5 标记：${marker}`)
   }
-  assert.match(persona, /send_message 续派同一 developer/)
-  assert.match(persona, /不为一两条风格建议无限打磨/)
-  assert.match(persona, /recon：只在缺少事实/)
-  assert.match(persona, /review：只在高风险/)
-  assert.match(persona, /scribe：只在文档属于验收范围/)
-  // 实际变更证据闭环：摘要/文件清单不等于 diff 审查。
-  for (const marker of ['实际变更证据', '不能只给文件清单', '不得声称审过实际 diff', '补证据']) {
+  assert.match(persona, /send_message.*developer/)
+  assert.match(persona, /不无限打磨/)
+  assert.match(persona, /recon.*仅在缺失事实/)
+  assert.match(persona, /review.*仅高风险/)
+  assert.match(persona, /scribe.*仅文档属验收范围/)
+  for (const marker of ['分层变更证据', '只有文件清单或口头摘要不算审过 diff', '补证据']) {
     assert.ok(persona.includes(marker), `缺实际变更证据标记：${marker}`)
   }
-  assert.match(persona, /git diff.*等价|等价.*git diff/s)
-  assert.match(persona, /修改前后内容/)
+  assert.match(persona, /git diff/)
+  assert.match(persona, /200 行/)
   assert.doesNotMatch(persona, /只有改动摘要也算证据|只给文件清单(?:也)?可以/)
 })
 
@@ -934,17 +963,17 @@ test('派工事实：实际 develop/send_message 工具调用才是派工，文�
   const definition = P.buildPresetDefinition({
     settings: base(),
     mode: P.resolveDevelopMode({ requestedMode: 'standard' }),
+    internalPresets: { scout: true, scribe: true },
   })
   const personaRow = definition.plugins.find((row) => row.id === 'persona')
   const persona = `${personaRow.config.prefix}${personaRow.config.suffix}`
   for (const marker of [
     '文本不是派工',
-    '必须实际调用 develop',
-    '只有工具接受后才可说“已派出 developer”',
-    '未派工',
-    '任务书是 develop 的 prompt 参数',
-    '不得停在计划、前言或任务书文本',
-    '实际调用 send_message',
+    '实际调用 develop',
+    '已派出 developer',
+    '未派工：原因',
+    'prompt',
+    'send_message',
   ]) {
     assert.ok(persona.includes(marker), `缺派工事实标记：${marker}`)
   }
@@ -1049,22 +1078,28 @@ test('任意有效 develop preset：不再限于 standard/deep-ptc', () => {
   })
   assert.equal(mode.effective, 'team-builder')
   assert.equal(mode.fallback, false)
-  const definition = P.buildPresetDefinition({ settings: base(), mode })
+  const definition = P.buildPresetDefinition({
+    settings: base(),
+    mode,
+    internalPresets: { scout: true, scribe: true },
+  })
   const develop = definition.plugins.find((row) => row.id === 'tool-subagent-develop')
   assert.equal(develop.config.agentPreset, 'team-builder')
   assert.match(definition.description, /团队施工/)
   const persona = definition.plugins.find((row) => row.id === 'persona').config.prefix
-  assert.match(persona, /当前施工子代理模式：团队施工（team-builder）/)
+  assert.match(persona, /当前施工子代理：团队施工（team-builder）/)
 })
 
 test('自引用与缺失/超时：保留配置原值，运行期回退 standard', async () => {
-  const selfMode = P.resolveDevelopMode({
-    requestedMode: 'dev-plan',
-    presets: [{ id: 'dev-plan', name: '开发规划与交付' }],
-    catalogChecked: true,
-  })
-  assert.equal(selfMode.fallback, true)
-  assert.match(selfMode.reason, /递归派工/)
+  for (const selfId of ['dev-plan', 'dev-plan-scout', 'dev-plan-scribe']) {
+    const selfMode = P.resolveDevelopMode({
+      requestedMode: selfId,
+      presets: [{ id: selfId, name: selfId }],
+      catalogChecked: true,
+    })
+    assert.equal(selfMode.fallback, true)
+    assert.match(selfMode.reason, /递归派工|内部预设/)
+  }
 
   const missing = P.resolveDevelopMode({
     requestedMode: 'removed-preset',
@@ -1086,8 +1121,9 @@ test('自引用与缺失/超时：保留配置原值，运行期回退 standard'
   assert.equal(state.body.requestedMode, 'removed-preset')
   assert.equal(state.body.effectiveMode, 'standard')
   assert.equal(state.body.fallback.active, true)
+  const mainDef = registry.definitions.find((d) => d.id === 'dev-plan')
   assert.equal(
-    registry.definitions[0].plugins.find((row) => row.id === 'tool-subagent-develop').config.agentPreset,
+    mainDef.plugins.find((row) => row.id === 'tool-subagent-develop').config.agentPreset,
     'standard',
   )
   await ctx.dispose()
@@ -1262,23 +1298,23 @@ test('施工目录/权限规则写入主代理 persona', () => {
   const definition = P.buildPresetDefinition({
     settings: base(),
     mode: P.resolveDevelopMode({ requestedMode: 'standard' }),
+    internalPresets: { scout: true, scribe: true },
   })
   const persona = definition.plugins.find((row) => row.id === 'persona').config.prefix
   for (const marker of [
-    '施工目录与权限',
-    '工具创建参数',
+    '施工目录边界',
     'cwd',
     '可写工作区',
-    '不得先以其他目录 spawn',
-    'working_directory / cd',
-    '不假设已有子代理权限会随之扩大',
-    '沙箱模式',
-    '真实错误原文',
+    'working_directory',
+    'cd',
+    '父会话事后提权不扩大已有子代理权限',
+    '沙箱',
+    '原错',
   ]) {
     assert.ok(persona.includes(marker), `缺权限防护标记：${marker}`)
   }
-  assert.match(persona, /目标目录不在可写范围/)
-  assert.match(persona, /停止派工/)
+  assert.match(persona, /不在范围或不确定时停止并问用户/)
+  assert.match(persona, /目标子目录尚未创建.*已存在的父目录.*自行创建该子目录/)
 })
 
 test('设置页契约：动态预设/模型下拉、原生控件、label 关联与守门范围开关', () => {
@@ -1327,7 +1363,7 @@ test('state 返回真实预设目录：名称、broken 与自定义预设生效'
   assert.equal(state.body.presets.rows[1].name, '团队施工')
   assert.equal(state.body.presets.rows[2].broken, 'import failed')
   assert.equal(
-    registry.definitions[0].plugins.find((row) => row.id === 'tool-subagent-develop').config.agentPreset,
+    registry.definitions.find((d) => d.id === 'dev-plan').plugins.find((row) => row.id === 'tool-subagent-develop').config.agentPreset,
     'team-builder',
   )
   await ctx.dispose()
@@ -1465,4 +1501,412 @@ test('client 行为：provider→model 联动取首个模型，旧 provider/mode
   const modelOptions = api.modelChoices(providers[0].models, 'gone', T)
   assert.equal(modelOptions.find((choice) => choice.value === 'gone').disabled, true)
   assert.equal(modelOptions.find((choice) => choice.value === 'a1').label, 'A1（a1）')
+})
+
+// ── v0.4.0 新增测试（WP5）──────────────────────────────────────────────────
+
+test('v0.4.0 preset 长度预算与子代理专用模板嵌入主预设', () => {
+  const def = P.buildPresetDefinition({
+    settings: base(),
+    mode: P.resolveDevelopMode({ requestedMode: 'standard' }),
+  })
+  const persona = def.plugins.find((row) => row.id === 'persona').config
+  const total = persona.prefix.length + persona.suffix.length
+  assert.ok(total <= 6000, `persona 总长应 <= 6000，实际 ${total}`)
+  assert.ok(!persona.prefix.includes('ROLE-TEMPLATE:SCOUT:BEGIN'), '不再使用旧的千字长模板标记')
+  assert.ok(persona.prefix.includes('仅给子代理用，不改变主窗自身规则'))
+  assert.ok(persona.prefix.includes('【仅子代理用 · 侦察/复核约束】'))
+  assert.ok(persona.prefix.includes('【仅子代理用 · 文书落盘约束】'))
+  assert.equal(def.plugins.find((r) => r.id === 'tool-subagent-recon').config.agentPreset, 'standard')
+  assert.equal(def.plugins.find((r) => r.id === 'tool-subagent-review').config.agentPreset, 'standard')
+  assert.equal(def.plugins.find((r) => r.id === 'tool-subagent-scribe').config.agentPreset, 'standard')
+  const pruner = def.plugins
+    .find((r) => r.id === 'compaction')
+    .config.find((r) => r.id === 'tool-result-pruner').config
+  assert.deepEqual(pruner, { thresholdChars: 24576, headChars: 16384, tailChars: 4096 })
+})
+
+test('v0.4.0 内部轻量子预设插件面：dev-plan-scout 与 dev-plan-scribe 绝不含 Shell/委派', () => {
+  const forbidden = new Set([
+    '@deepseek-ai/dsh-tool-bash',
+    '@deepseek-ai/dsh-tool-pwsh',
+    '@deepseek-ai/dsh-tool-workflow',
+    '@deepseek-ai/dsh-tool-jobs',
+    '@deepseek-ai/dsh-tool-schedule',
+    '@deepseek-ai/dsh-tool-goal',
+    '@deepseek-ai/dsh-tool-skill',
+    '@deepseek-ai/dsh-tool-todo',
+    '@deepseek-ai/dsh-tool-subagent',
+    '@deepseek-ai/dsh-plan-mode',
+  ])
+  const collect = (plugins, out = []) => {
+    for (const row of plugins ?? []) {
+      out.push(row)
+      if (Array.isArray(row?.config)) collect(row.config, out)
+    }
+    return out
+  }
+
+  const scout = P.buildScoutPresetDefinition()
+  assert.equal(scout.id, 'dev-plan-scout')
+  assert.equal(scout.order, 990)
+  const scoutRows = collect(scout.plugins)
+  for (const row of scoutRows) {
+    assert.ok(!forbidden.has(row.name), `dev-plan-scout 不应含 ${row.name}`)
+  }
+  assert.equal(scoutRows.find((r) => r.name === '@deepseek-ai/dsh-tool-fs')?.config?.applyPatch, false)
+  assert.deepEqual(
+    scoutRows.find((r) => r.name === '@deepseek-ai/dsh-tool-fs-search')?.config,
+    { sampleOverCapGlobResults: false },
+  )
+  assert.deepEqual(
+    scoutRows.find((r) => r.name === '@deepseek-ai/dsh-tool-web')?.config,
+    { fetch: true, searchTimeoutMs: 60000 },
+  )
+
+  const scribe = P.buildScribePresetDefinition()
+  assert.equal(scribe.id, 'dev-plan-scribe')
+  assert.equal(scribe.order, 991)
+  const scribeCompaction = scribe.plugins.find((r) => r.id === 'compaction')
+  assert.equal(scribeCompaction?.group, true)
+  assert.deepEqual(scribeCompaction?.isolate, { compaction: true, toolResultPruner: true })
+  const scribeRows = collect(scribe.plugins)
+  for (const row of scribeRows) {
+    assert.ok(!forbidden.has(row.name), `dev-plan-scribe 不应含 ${row.name}`)
+  }
+  assert.equal(scribeRows.find((r) => r.name === '@deepseek-ai/dsh-tool-fs')?.config?.applyPatch, false)
+  assert.ok(!scribeRows.some((r) => r.name === '@deepseek-ai/dsh-tool-fs-search'))
+  assert.ok(!scribeRows.some((r) => r.name === '@deepseek-ai/dsh-tool-web'))
+})
+
+test('v0.4.0 不向宿主公开列表注册 scout/scribe 独立预设，避免污染预设选择器', async () => {
+  const registry = createFakeRegistry()
+  const webServer = createFakeWebServer()
+  const ctx = createFakeContext({ registry, webServer })
+  index.apply(ctx.ctx, base(), { verificationDelayMs: 0 })
+  await ctx.flush()
+
+  assert.deepEqual(registry.definitions.map((d) => d.id), ['dev-plan'])
+  const mainDef = registry.definitions[0]
+  assert.equal(mainDef.plugins.find((r) => r.id === 'tool-subagent-recon').config.agentPreset, 'standard')
+  assert.equal(mainDef.plugins.find((r) => r.id === 'tool-subagent-review').config.agentPreset, 'standard')
+  assert.equal(mainDef.plugins.find((r) => r.id === 'tool-subagent-scribe').config.agentPreset, 'standard')
+
+  const state = await callRoute(webServer.handlers.get('/plugins/dev-plan-presets/state'), 'GET')
+  assert.equal(state.body.registration, 'active')
+  assert.deepEqual(state.body.internalPresets, { scout: false, scribe: false })
+  await ctx.dispose()
+})
+
+test('v0.4.0 mainToolMode 三档矩阵：插件面、persona 规则与严格校验', () => {
+  const neverAllowed = [
+    '@deepseek-ai/dsh-tool-bash',
+    '@deepseek-ai/dsh-tool-pwsh',
+    '@deepseek-ai/dsh-tool-workflow',
+    '@deepseek-ai/dsh-tool-jobs',
+    '@deepseek-ai/dsh-tool-schedule',
+    '@deepseek-ai/dsh-tool-goal',
+    '@deepseek-ai/dsh-tool-skill',
+    '@deepseek-ai/dsh-tool-todo',
+    '@deepseek-ai/dsh-plan-mode',
+  ]
+  const mode = P.resolveDevelopMode({ requestedMode: 'standard' })
+
+  const noneDef = P.buildPresetDefinition({
+    settings: { ...base(), mainToolMode: 'none' },
+    mode,
+    internalPresets: { scout: true, scribe: true },
+  })
+  assert.ok(!noneDef.plugins.some((r) => r.name === '@deepseek-ai/dsh-tool-fs'))
+  assert.ok(!noneDef.plugins.some((r) => r.name === '@deepseek-ai/dsh-tool-fs-search'))
+  assert.match(noneDef.plugins.find((r) => r.id === 'persona').config.prefix, /主窗工具权限（none）/)
+
+  const roDef = P.buildPresetDefinition({
+    settings: { ...base(), mainToolMode: 'readonly' },
+    mode,
+    internalPresets: { scout: true, scribe: true },
+  })
+  assert.ok(!roDef.plugins.some((r) => r.name === '@deepseek-ai/dsh-tool-fs'))
+  const roSearch = roDef.plugins.find((r) => r.name === '@deepseek-ai/dsh-tool-fs-search')
+  assert.deepEqual(roSearch?.config, { sampleOverCapGlobResults: false })
+  assert.match(roDef.plugins.find((r) => r.id === 'persona').config.prefix, /主窗工具权限（readonly）/)
+
+  const editDef = P.buildPresetDefinition({
+    settings: { ...base(), mainToolMode: 'ask-edit' },
+    mode,
+    internalPresets: { scout: true, scribe: true },
+  })
+  const fsRow = editDef.plugins.find((r) => r.name === '@deepseek-ai/dsh-tool-fs')
+  assert.ok(fsRow && fsRow.config?.applyPatch === false)
+  assert.deepEqual(
+    editDef.plugins.find((r) => r.name === '@deepseek-ai/dsh-tool-fs-search')?.config,
+    { sampleOverCapGlobResults: false },
+  )
+  for (const def of [noneDef, roDef, editDef]) {
+    for (const pkgName of neverAllowed) {
+      assert.ok(!def.plugins.some((r) => r.name === pkgName), `主窗永不应挂 ${pkgName}`)
+    }
+  }
+  assert.match(editDef.plugins.find((r) => r.id === 'persona').config.prefix, /主窗工具权限（ask-edit）/)
+
+  // settings 校验
+  for (const validMode of ['none', 'readonly', 'ask-edit']) {
+    const res = S.validateSettings({ mainToolMode: validMode, mainStepWarnThreshold: 2 })
+    assert.equal(res.issues, undefined)
+    assert.equal(res.value.mainToolMode, validMode)
+  }
+  assert.ok(S.validateSettings({ mainToolMode: 'full-shell' }).issues.some((i) => i.path[0] === 'mainToolMode'))
+  assert.ok(S.validateSettings({ mainStepWarnThreshold: 1 }).issues.some((i) => i.path[0] === 'mainStepWarnThreshold'))
+  assert.ok(S.validateSettings({ mainStepWarnThreshold: 31 }).issues.some((i) => i.path[0] === 'mainStepWarnThreshold'))
+  assert.ok(S.validateSettings({ mainStepWarnThreshold: 4.5 }).issues.some((i) => i.path[0] === 'mainStepWarnThreshold'))
+})
+
+test('v0.4.0 index.js 性能优化：免冗余二次复检、ETag 304 与空闲预热 modelCatalog', async () => {
+  // 1) deep-ptc 首次命中后不再在 2s 后冗余触发第二次 registry.list()
+  let listCalls = 0
+  const registry = createFakeRegistry({ rows: [{ id: 'deep-ptc' }] })
+  registry.list = async () => {
+    listCalls += 1
+    return [{ id: 'deep-ptc' }]
+  }
+  const webServer = createFakeWebServer()
+  let modelCalls = 0
+  const llm = {
+    listProviders: () => [{ id: 'p', name: 'P' }],
+    listModels: async () => {
+      modelCalls += 1
+      return [{ id: 'm', name: 'M' }]
+    },
+  }
+  const ctx = createFakeContext({ registry, webServer, llm })
+  index.apply(
+    ctx.ctx,
+    { ...base(), developMode: 'deep-ptc' },
+    { verificationDelayMs: 40, prewarmDelayMs: 10 },
+  )
+  await ctx.flush()
+  await sleep(90)
+  await ctx.flush()
+  assert.equal(listCalls, 1, '首次已找到目标 preset 时不应触发冗余二次 registry.list()')
+  assert.equal(modelCalls, 1, '空闲预热应预先枚举一次模型目录')
+
+  // 2) 首次 /state 直接命中已预热 modelCatalog，且带 ETag 支持 304
+  const handler = webServer.handlers.get('/plugins/dev-plan-presets/state')
+  const first = await callRoute(handler, 'GET')
+  assert.equal(first.code, 200)
+  assert.equal(first.body.modelCatalog.checked, true)
+  const etag = first.headers.etag
+  assert.ok(etag, '响应头应包含 etag')
+
+  const notModified = await callRoute(handler, 'GET', undefined, { 'if-none-match': etag })
+  assert.equal(notModified.code, 304)
+  assert.equal(notModified.body, null)
+  assert.equal(notModified.headers.etag, etag)
+  await ctx.dispose()
+})
+
+test('v0.4.0 guard.js 优化：stopped 快速拒绝、effect 释放清理与主会话步数软提醒', async () => {
+  // 1) stopped=true 时直接 reject，不再调 next()
+  const registry = createFakeRegistry()
+  const child = createFakeAgent({ id: 'child-fast', parentSession: 'main', origin: 'subagent', current: undefined })
+  const parent = createFakeAgent({
+    id: 'main',
+    agentPreset: 'dev-plan',
+    current: { provider: 'expensive', model: 'main' },
+  })
+  const ctx = createFakeContext({
+    registry,
+    agents: { get: (id) => (id === 'main' ? parent.agent : child.agent) },
+  })
+  index.apply(ctx.ctx, base(), { verificationDelayMs: 0 })
+  await ctx.flush()
+  ctx.listeners.get('agent/created')[0]({ agent: child.agent })
+  let nextCount = 0
+  const next = async () => {
+    nextCount += 1
+    return { kind: 'enter', messages: [] }
+  }
+  const firstDecision = await child.stepHandlers[0](
+    { modelSelection: { provider: 'other', model: 'bad' } },
+    next,
+  )
+  assert.deepEqual(firstDecision, { kind: 'reject' })
+  assert.equal(nextCount, 1)
+  const secondDecision = await child.stepHandlers[0](
+    { modelSelection: { provider: 'other', model: 'bad' } },
+    next,
+  )
+  assert.deepEqual(secondDecision, { kind: 'reject' })
+  assert.equal(nextCount, 1, 'stopped=true 后应短路，不再调用 next()')
+
+  // 2) agent.ctx.effect 清理时同步移除 stepHandler，不依赖 agent/disposed
+  for (const dispose of child.agentEffects) dispose()
+  assert.equal(child.stepHandlers.length, 0)
+  await ctx.dispose()
+
+  // 3) mainToolMode='ask-edit' 下主会话步数超阈值触发温和提醒（不 select、不 cancel、不 reject）
+  const budgetRegistry = createFakeRegistry()
+  const mainAgent = createFakeAgent({
+    id: 'main-budget',
+    agentPreset: 'dev-plan',
+    current: { provider: 'expensive', model: 'main' },
+  })
+  const budgetCtx = createFakeContext({ registry: budgetRegistry })
+  index.apply(
+    budgetCtx.ctx,
+    { ...base(), modelGuardMode: 'off', mainToolMode: 'ask-edit', mainStepWarnThreshold: 2 },
+    { verificationDelayMs: 0 },
+  )
+  await budgetCtx.flush()
+  const created = budgetCtx.listeners.get('agent/created')
+  assert.ok(Array.isArray(created) && created.length >= 1, 'mainToolMode!=none 时即便 guard=off 也应挂载主窗步数提醒')
+  created[0]({ agent: mainAgent.agent })
+  assert.equal(mainAgent.stepHandlers.length, 1)
+
+  for (let i = 0; i < 4; i += 1) {
+    const decision = await mainAgent.stepHandlers[0](
+      { turnId: 't1' },
+      async () => ({ kind: 'enter', messages: [] }),
+    )
+    assert.equal(decision.kind, 'enter', '主会话步数提醒永不 reject')
+  }
+  assert.equal(mainAgent.selects.length, 0, '主会话永不被 select')
+  assert.equal(mainAgent.cancelled.length, 0, '主会话永不被 cancel')
+  assert.equal(mainAgent.injected.length, 1, '同回合超阈值只温和提醒 1 次')
+  assert.match(mainAgent.injected[0].content[0].text, /转交 recon \/ develop/)
+
+  // 新回合重置计数
+  for (let i = 0; i < 3; i += 1) {
+    await mainAgent.stepHandlers[0]({ turnId: 't2' }, async () => ({ kind: 'enter', messages: [] }))
+  }
+  assert.equal(mainAgent.injected.length, 2)
+  await budgetCtx.dispose()
+})
+
+test('v0.4.0 client.js 行为与优化契约：禁用全部内部预设、304 跳过重渲染与新字段', async () => {
+  const api = await loadClientTestApi()
+  const T = (cn) => cn
+  const choices = api.presetChoices(
+    [
+      { id: 'dev-plan', name: '开发规划与交付' },
+      { id: 'dev-plan-scout', name: '内部侦察' },
+      { id: 'dev-plan-scribe', name: '内部文书' },
+      { id: 'deep-ptc', name: '深度 PTC' },
+    ],
+    'standard',
+    ['dev-plan', 'dev-plan-scout', 'dev-plan-scribe'],
+    T,
+  )
+  const byValue = Object.fromEntries(choices.map((c) => [c.value, c]))
+  assert.equal(byValue['dev-plan'].disabled, true)
+  assert.equal(byValue['dev-plan-scout'].disabled, true)
+  assert.equal(byValue['dev-plan-scribe'].disabled, true)
+  assert.equal(byValue['deep-ptc'].disabled, undefined)
+
+  assert.equal(api.isStateConverged(null), false)
+  assert.equal(
+    api.isStateConverged({
+      registration: 'active',
+      modelCatalog: { checked: false },
+      presets: { checked: true },
+    }),
+    false,
+  )
+  assert.equal(
+    api.isStateConverged({
+      registration: 'active',
+      modelCatalog: { checked: true },
+      presets: { checked: true },
+    }),
+    true,
+  )
+
+  const clientSource = readFileSync(join(ROOT, 'client.js'), 'utf8')
+  for (const marker of [
+    'if-none-match',
+    '304',
+    'stateVersion',
+    'FAST_POLL_MS = 700',
+    'IDLE_POLL_MS = 30000',
+    'visibilitychange',
+    'document.hidden',
+    'AbortController',
+    'React.useMemo',
+    'timersRef',
+    'mainToolMode',
+    'mainStepWarnThreshold',
+    'scheduleNextRef',
+    'stateTag',
+    '超过阈值仅提示转交子代理，绝不强制中断或改换主模型',
+  ]) {
+    assert.ok(clientSource.includes(marker), `client.js 缺少 v0.4.0 标记：${marker}`)
+  }
+  assert.ok(!/setInterval\(/.test(clientSource), 'client.js 不应再使用固定 setInterval 轮询')
+
+  const mode = P.resolveDevelopMode({ requestedMode: 'standard' })
+  assert.doesNotMatch(P.buildDescription(mode, 'ask-edit'), /永不亲自写代码/)
+  assert.match(P.buildDescription(mode, 'ask-edit'), /局部微改/)
+  assert.match(P.buildDescription(mode, 'readonly'), /只读检索/)
+})
+
+test('v0.4.0 插件重载后不同实例相同 stateVersion 不返回 304', async () => {
+  const webServer1 = createFakeWebServer()
+  const ctx1 = createFakeContext({ registry: createFakeRegistry(), webServer: webServer1 })
+  index.apply(ctx1.ctx, base(), { verificationDelayMs: 0, prewarmModelCatalog: false })
+  await ctx1.flush()
+  const first = await callRoute(webServer1.handlers.get('/plugins/dev-plan-presets/state'), 'GET')
+  assert.equal(first.code, 200)
+  assert.ok(typeof first.body.stateTag === 'string' && first.body.stateTag.length > 0)
+  await ctx1.dispose()
+
+  const webServer2 = createFakeWebServer()
+  const ctx2 = createFakeContext({ registry: createFakeRegistry(), webServer: webServer2 })
+  index.apply(ctx2.ctx, base(), { verificationDelayMs: 0, prewarmModelCatalog: false })
+  await ctx2.flush()
+  const handler2 = webServer2.handlers.get('/plugins/dev-plan-presets/state')
+  const second = await callRoute(handler2, 'GET', undefined, { 'if-none-match': first.headers.etag })
+  assert.equal(second.code, 200, '不同插件实例即使 stateVersion 相同也不应命中旧实例 ETag 返回 304')
+  assert.equal(second.body.stateVersion, first.body.stateVersion)
+  assert.notEqual(second.body.stateTag, first.body.stateTag)
+  assert.notEqual(second.headers.etag, first.headers.etag)
+  await ctx2.dispose()
+})
+
+test('v0.4.0 guard 注入自身 source 消息不重置步数提醒', async () => {
+  const registry = createFakeRegistry()
+  const messages = [{ role: 'user', id: 'u1', content: 'start' }]
+  const mainAgent = createFakeAgent({
+    id: 'main-self-msg',
+    agentPreset: 'dev-plan',
+    current: { provider: 'expensive', model: 'main' },
+  })
+  mainAgent.agent.session.messages = messages
+  mainAgent.agent.inject = (msg) => {
+    mainAgent.injected.push(msg)
+    messages.push({ role: 'user', id: `inj-${messages.length}`, ...msg })
+  }
+
+  const ctx = createFakeContext({ registry })
+  index.apply(
+    ctx.ctx,
+    { ...base(), modelGuardMode: 'off', mainToolMode: 'ask-edit', mainStepWarnThreshold: 2 },
+    { verificationDelayMs: 0, prewarmModelCatalog: false },
+  )
+  await ctx.flush()
+  ctx.listeners.get('agent/created')[0]({ agent: mainAgent.agent })
+
+  // 没有传 turnId，靠 session.messages 识别回合；第 3 步触发注入后，第 4/5/6 步不应重置再提醒
+  for (let i = 0; i < 6; i += 1) {
+    const decision = await mainAgent.stepHandlers[0]({}, async () => ({ kind: 'enter', messages: [] }))
+    assert.equal(decision.kind, 'enter')
+  }
+  assert.equal(mainAgent.injected.length, 1, '自身注入的 source.kind=dev-plan-presets 消息不应重置当轮计数')
+
+  // 真正的新用户消息到来后，计数重置并可在超阈值后再次提醒一次
+  messages.push({ role: 'user', id: 'u2', content: 'next turn' })
+  for (let i = 0; i < 3; i += 1) {
+    await mainAgent.stepHandlers[0]({}, async () => ({ kind: 'enter', messages: [] }))
+  }
+  assert.equal(mainAgent.injected.length, 2)
+  await ctx.dispose()
 })
